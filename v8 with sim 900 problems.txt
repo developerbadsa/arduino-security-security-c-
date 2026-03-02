@@ -1,0 +1,155 @@
+#include <Arduino.h>
+
+static const int SIM_RX = 26;
+static const int SIM_TX = 27;
+
+static const uint32_t BAUDS[] = {9600, 19200, 38400, 57600, 115200};
+static uint32_t currentBaud = 0;
+
+static const char *DIAL_NUMBER = "01877104723";
+
+static void flushSIM() {
+  while (Serial2.available()) Serial2.read();
+}
+
+static bool readLine(String &out, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  out = "";
+  while (millis() - start < timeoutMs) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        out.trim();
+        if (out.length()) return true;
+        out = "";
+      } else {
+        out += c;
+        if (out.length() > 240) out.remove(0, 120);
+      }
+    }
+    delay(2);
+    yield();
+  }
+  out.trim();
+  return out.length() > 0;
+}
+
+static void sendRaw(const char *cmd) {
+  Serial.print(">> ");
+  Serial.println(cmd);
+  Serial2.print(cmd);
+  Serial2.print("\r\n");
+}
+
+static void dumpFor(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    String line;
+    if (readLine(line, 200)) {
+      Serial.print("<< ");
+      Serial.println(line);
+    }
+    delay(2);
+    yield();
+  }
+}
+
+static bool tryBaud(uint32_t baud) {
+  Serial2.end();
+  delay(50);
+  Serial2.begin(baud, SERIAL_8N1, SIM_RX, SIM_TX);
+  delay(250);
+  flushSIM();
+
+  Serial.print("\nTrying baud: ");
+  Serial.println(baud);
+
+  sendRaw("AT");
+  uint32_t start = millis();
+  while (millis() - start < 900) {
+    String line;
+    if (readLine(line, 200)) {
+      Serial.print("<< ");
+      Serial.println(line);
+      if (line.indexOf("OK") >= 0) return true;
+    }
+    delay(2);
+    yield();
+  }
+  return false;
+}
+
+static bool detectModule() {
+  for (size_t i = 0; i < sizeof(BAUDS) / sizeof(BAUDS[0]); i++) {
+    if (tryBaud(BAUDS[i])) {
+      currentBaud = BAUDS[i];
+      return true;
+    }
+  }
+  return false;
+}
+
+static void statusOnce() {
+  Serial.println("\n--- STATUS ---");
+  sendRaw("ATE0");      dumpFor(600);
+  sendRaw("AT+CMEE=2"); dumpFor(600);
+
+  sendRaw("ATI");       dumpFor(1000);
+  sendRaw("AT+CCID");   dumpFor(1200);
+  sendRaw("AT+CPIN?");  dumpFor(1200);
+
+  sendRaw("AT+CSQ");    dumpFor(1200);
+  sendRaw("AT+CREG?");  dumpFor(1200);
+  sendRaw("AT+COPS?");  dumpFor(1500);
+  Serial.println("--- END ---");
+}
+
+static void dial() {
+  sendRaw("ATD01877104723;");
+  dumpFor(1500);
+}
+
+static void hangup() {
+  sendRaw("ATH");
+  dumpFor(800);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n=== SIM900A UART2 Test (GPIO26/27) ===");
+  Serial.println("Keys: s=status, c=call, h=hangup");
+
+  if (!detectModule()) {
+    Serial.println("\nModule NOT responding.");
+    Serial.println("Fix: power OFF then insert SIM, strong 5V 2A, TX/RX cross, GND common.");
+    return;
+  }
+
+  Serial.print("Detected baud: ");
+  Serial.println(currentBaud);
+
+  statusOnce();
+}
+
+void loop() {
+  while (Serial2.available()) Serial.write(Serial2.read());
+
+  static uint32_t last = 0;
+  if (millis() - last > 10000) {
+    last = millis();
+    statusOnce();
+  }
+
+  if (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == 's') statusOnce();
+    else if (ch == 'c') dial();
+    else if (ch == 'h') hangup();
+  }
+
+  delay(5);
+  yield();
+}
