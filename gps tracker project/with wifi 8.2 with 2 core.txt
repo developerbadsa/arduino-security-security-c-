@@ -1,0 +1,1623 @@
+/*=============================================================
+ *  SmartBike v8.0  "Deep Recharge"
+ *  Senior embedded rewrite — FreeRTOS dual-core architecture
+ *  Board: ESP32 Dev Module
+ *=============================================================
+ *
+ *  ROOT CAUSES FIXED FROM v7.x
+ *  ============================
+ *  [BUG-1] Local portal hangs / blank UI
+ *    httpPostJSON() blocks loop() up to 2500 ms.
+ *    handleClient() never called → browser TCP timeout.
+ *    FIX: ALL HTTP lives in netTask on Core 0.
+ *         loop() (Core 1) only calls handleClient() — always fast.
+ *
+ *  [BUG-2] WiFi mode-switch glitches
+ *    softAP start/stop called WiFi.mode(WIFI_AP_STA / WIFI_STA)
+ *    → STA drops, reconnect lag, AP SSID disappears temporarily.
+ *    FIX: WIFI_AP_STA from boot, AP never turned off.
+ *         Only STA connect/disconnect is managed dynamically.
+ *
+ *  [BUG-3] Blocking internet probe in hot path
+ *    internetProbe() ran DNS + TCP connect synchronously — 1-1.5 s.
+ *    FIX: Probe runs inside netTask; result cached in gInternetOk.
+ *
+ *  [BUG-4] IMU / security gaps during HTTP
+ *    pushTrackBatch() or pollCommand() could take 3+ s (retry).
+ *    During that time IMU not read, alarms miss events.
+ *    FIX: IMU + security run every 20 ms on Core 1, uninterrupted.
+ *
+ *  [BUG-5] GPS data loss during HTTP
+ *    GPS UART buffer is 256 bytes. 2.5 s of 9600 baud → ~230 bytes.
+ *    If pump() not called, buffer overflows, sentences corrupt.
+ *    FIX: gpsPump() runs every loop() tick on Core 1.
+ *
+ *  [BUG-6] No thread safety on shared state
+ *    rawBuf, locked, armed, alarmLatched written by Core 1,
+ *    read/cleared by Core 0 (HTTP push) — data races.
+ *    FIX: stateMutex protects all shared state.
+ *         Core 0 takes mutex only to snapshot/copy data,
+ *         releases before HTTP → Core 1 never blocks long.
+ *
+ *  ARCHITECTURE
+ *  ============
+ *  Core 1 / loop()          — NEVER blocks on network
+ *    · gpsPump()
+ *    · updateImuMotion()
+ *    · updateSecurityAlarm()
+ *    · buzzerUpdate()
+ *    · localPortalMaintenance() → handleClient() always fast
+ *    · LED blink
+ *    · Drain cmdQueue (execute polled commands here)
+ *    · recordSamplePoint / recordHeartbeatPoint
+ *
+ *  Core 0 / netTask()       — blocks freely
+ *    · wifiMaintenance()
+ *    · internetProbe()
+ *    · pumpPendingReport()
+ *    · pushTrackBatch()     — copies buf under mutex, then HTTP
+ *    · pollCommand()        → result pushed into cmdQueue
+ *
+ *  QUEUES / SYNC PRIMITIVES
+ *  ========================
+ *  stateMutex  SemaphoreHandle_t — guards all shared variables
+ *  cmdQueue    QueueHandle_t(4)  — netTask → loop: {cmd, cmdId}
+ *  reportQueue QueueHandle_t(4) — loop → netTask: {event, cmdId}
+ *=============================================================*/
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <TinyGPSPlus.h>
+#include <Wire.h>
+#include "mpu6500.h"
+#include <math.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include "esp32-hal-bt.h"
+#include <esp_bt.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+// ─────────────────────────────────────────────────────────────
+//  SERVER / DEVICE CONFIG
+// ─────────────────────────────────────────────────────────────
+static constexpr const char* SERVER_URL_PUSH   = "http://smartbike.ashikdev.com/api/device/push";
+static constexpr const char* SERVER_URL_POLL   = "http://smartbike.ashikdev.com/api/device/poll";
+static constexpr const char* SERVER_URL_REPORT = "http://smartbike.ashikdev.com/api/device/report";
+static constexpr const char* DEVICE_ID         = "BIKE01";
+
+// ─────────────────────────────────────────────────────────────
+//  WIFI CONFIG
+// ─────────────────────────────────────────────────────────────
+static constexpr const char* WIFI_SSID     = "a";
+static constexpr const char* WIFI_PASS     = "87654321q";
+static constexpr const char* LOCAL_AP_PASS = "bikelocal88";
+static constexpr const char* LOCAL_PIN     = "2234";
+
+// ─────────────────────────────────────────────────────────────
+//  DEBUG FLAGS
+// ─────────────────────────────────────────────────────────────
+static constexpr bool DBG_NET       = true;
+static constexpr bool DBG_HTTP_BODY = true;
+static constexpr bool DBG_GPS       = true;
+static constexpr bool DBG_IMU       = false;
+static constexpr bool DBG_SEC       = true;
+static constexpr bool DBG_LOCAL     = true;
+
+// ─────────────────────────────────────────────────────────────
+//  HARDWARE PINS
+// ─────────────────────────────────────────────────────────────
+static constexpr int GPS_RX   = 16;
+static constexpr int GPS_TX   = 17;
+static constexpr int I2C_SDA  = 21;
+static constexpr int I2C_SCL  = 22;
+static constexpr int RELAY_PIN        = 25;
+static constexpr int BUZZER_RELAY_PIN = 32;
+static constexpr int LED_PIN          = 33;
+static constexpr int ONBOARD_LED_PIN  = 2;
+static constexpr bool RELAY_ACTIVE_LOW = true;
+
+// ─────────────────────────────────────────────────────────────
+//  TIMING CONSTANTS
+// ─────────────────────────────────────────────────────────────
+static constexpr uint32_t SAMPLE_INTERVAL_MOVING_MS  = 1000UL;
+static constexpr uint32_t SAMPLE_INTERVAL_STILL_MS   = 2000UL;
+static constexpr uint32_t PUSH_INTERVAL_MOVING_MS    = 15000UL;
+static constexpr uint32_t PUSH_INTERVAL_STILL_MS     = 120000UL;
+static constexpr uint32_t PUSH_INTERVAL_NONET_MS     = 300000UL;
+static constexpr uint32_t POLL_INTERVAL_FAST_MS      = 1200UL;
+static constexpr uint32_t POLL_INTERVAL_NORMAL_MS    = 2500UL;
+static constexpr uint32_t POLL_INTERVAL_NONET_MS     = 180000UL;
+static constexpr uint32_t HEARTBEAT_INTERVAL_MS      = 5UL * 60UL * 1000UL;
+static constexpr uint32_t NET_CHECK_EVERY_MS         = 8000UL;
+static constexpr uint32_t NET_OK_TTL_MS              = 15000UL;
+static constexpr uint32_t REPORT_RETRY_MS            = 5000UL;
+static constexpr uint32_t HTTP_TIMEOUT_MS            = 3000UL;
+
+// Buzzer
+static constexpr uint32_t ALARM_BUZZ_MS    = 12000UL;
+static constexpr uint32_t ALARM_COOLDOWN_MS = 2000UL;
+
+// IMU
+static constexpr uint32_t IMU_READ_EVERY_MS = 20UL;
+static constexpr uint32_t MOVING_HOLD_MS    = 1200UL;
+static constexpr float    GYRO_MOVING_ON    = 0.30f;   // rad/s
+static constexpr float    GYRO_MOVING_OFF   = 0.22f;
+static constexpr float    ACCEL_DELTA_ON    = 0.25f;   // fraction of G
+static constexpr float    ACCEL_DELTA_OFF   = 0.15f;
+static constexpr float    G_MPS2            = 9.80665f;
+static constexpr uint16_t CAL_SAMPLES       = 250;
+static constexpr uint16_t CAL_DELAY_MS      = 10;
+
+// Security
+static constexpr float    TOUCH_DELTA_G     = 0.04f;
+static constexpr float    TOUCH_GYRO        = 0.12f;
+static constexpr uint32_t TOUCH_TRIGGER_MS  = 80UL;
+static constexpr uint32_t TOUCH_DEBOUNCE_MS = 100UL;
+static constexpr float    KNOCK_DELTA_G     = 0.18f;
+static constexpr float    KNOCK_GYRO        = 0.80f;
+static constexpr uint32_t KNOCK_WINDOW_MS   = 2500UL;
+static constexpr uint32_t KNOCK_DEBOUNCE_MS = 180UL;
+static constexpr uint8_t  KNOCK_COUNT_REQ   = 2;
+static constexpr uint32_t TAMPER_MOTION_MS  = 900UL;
+
+// Speed filter
+static constexpr float    MIN_SPEED_KMPH    = 2.0f;
+static constexpr float    MAX_SPEED_KMPH    = 130.0f;
+static constexpr float    SPEED_ALPHA       = 0.4f;
+static constexpr int      STOP_COUNT_REQ    = 4;
+
+// Track buffer
+static constexpr int MAX_RAW_POINTS   = 20;
+static constexpr int MAX_TRACK_POINTS = 5;
+static constexpr float  MIN_SAMPLE_DIST_M = 12.0f;
+static constexpr double MAX_JUMP_DIST_M   = 50000.0;
+
+// Local portal PIN
+static constexpr uint8_t  LOCAL_PIN_FAIL_MAX = 5;
+static constexpr uint32_t LOCAL_PIN_LOCK_MS  = 30000UL;
+
+// WiFi backoff
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
+static constexpr uint32_t NET_BACKOFF_MAX_MS       = 5UL * 60UL * 1000UL;
+
+// ─────────────────────────────────────────────────────────────
+//  TYPES
+// ─────────────────────────────────────────────────────────────
+enum DeviceStateId : uint8_t { ST_LOCKED=0, ST_UNLOCKED=1, ST_MOVING=2, ST_ALARM=3 };
+
+struct TrackPoint {
+  double   lat, lon;
+  float    speed;
+  uint32_t tMs;
+  uint8_t  st;
+};
+
+struct BeepStep { uint16_t ms; uint8_t on; };
+
+// Inter-task message structs (must be POD, fixed size)
+struct CmdMsg {
+  char cmd[16];
+  char cmdId[40];
+};
+
+struct ReportMsg {
+  char event[24];
+  char cmdId[40];
+};
+
+// ─────────────────────────────────────────────────────────────
+//  FreeRTOS HANDLES
+// ─────────────────────────────────────────────────────────────
+static SemaphoreHandle_t stateMutex = nullptr;
+static QueueHandle_t     cmdQueue   = nullptr;   // netTask → loop
+static QueueHandle_t     reportQueue = nullptr;  // loop → netTask
+static TaskHandle_t      netTaskHandle = nullptr;
+
+// ─────────────────────────────────────────────────────────────
+//  HARDWARE OBJECTS
+// ─────────────────────────────────────────────────────────────
+HardwareSerial SerialGPS(1);
+TinyGPSPlus    gps;
+bfs::Mpu6500   imu(&Wire, bfs::Mpu6500::I2C_ADDR_PRIM);
+
+// ─────────────────────────────────────────────────────────────
+//  SHARED STATE  (ALL access must hold stateMutex)
+// ─────────────────────────────────────────────────────────────
+// Device state — written by loop (Core 1), read by netTask (Core 0)
+static volatile bool locked      = false;
+static volatile bool armed       = false;
+static volatile bool alarmLatched = false;
+static volatile uint32_t alarmCooldownUntil = 0;
+
+// Track buffer — written by loop, snapshot-copied by netTask
+static TrackPoint rawBuf[MAX_RAW_POINTS];
+static int        rawCount = 0;
+
+// Speed / IMU — written by loop, read by netTask for JSON
+static float filteredSpeed   = 0.0f;
+static bool  hasFilteredInit = false;
+static int   lowSpeedCount   = 0;
+static bool  imuMoving       = false;
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP-ONLY STATE  (Core 1, no mutex needed)
+// ─────────────────────────────────────────────────────────────
+static bool imuReady = false;
+struct GyroBias { float x=0, y=0, z=0; };
+static GyroBias imuBias;
+static uint32_t imuMovingHoldUntil = 0;
+static uint32_t lastImuReadAt = 0;
+static float    lastADeltaG = 0.0f;
+static float    lastGMag    = 0.0f;
+static uint32_t tamperMotionSince = 0;
+
+// Security
+static uint8_t  knockCount   = 0;
+static uint32_t firstKnockAt = 0;
+static uint32_t lastKnockAt  = 0;
+static uint32_t touchSince   = 0;
+static uint32_t lastTouchFireAt = 0;
+
+// Timers (Core 1)
+static uint32_t lastSample    = 0;
+static uint32_t lastHeartbeat = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  NET-TASK-ONLY STATE  (Core 0, no mutex needed)
+// ─────────────────────────────────────────────────────────────
+static volatile bool     gInternetOk      = false;
+static volatile uint32_t lastInternetOkAt = 0;
+static uint32_t lastNetCheckAt  = 0;
+static uint32_t lastPush        = 0;
+static uint32_t lastPoll        = 0;
+
+// WiFi backoff
+static bool     wifiConnecting        = false;
+static bool     wifiWasConnected      = false;
+static uint32_t wifiConnectStartedAt  = 0;
+static uint32_t nextNetTryAt          = 0;
+static uint32_t netBackoffMs          = 15000;
+static uint8_t  netFailStreak         = 0;
+
+// Pending report (drained inside netTask)
+static bool   pendingReport     = false;
+static char   pendingReportEvent[24] = {};
+static char   pendingReportCmdId[40] = {};
+static uint32_t lastReportTry  = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  LOCAL PORTAL STATE  (Core 1 only)
+// ─────────────────────────────────────────────────────────────
+static WebServer localServer(80);
+static DNSServer  localDns;
+static bool       localApActive         = false;
+static uint32_t   localApLastActivityAt = 0;
+static uint8_t    localPinFailCount     = 0;
+static uint32_t   localPinLockedUntil   = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  BUZZER ENGINE  (Core 1 only)
+// ─────────────────────────────────────────────────────────────
+enum BuzzerMode : uint8_t { BUZ_OFF=0, BUZ_ALARM=1, BUZ_PATTERN=2 };
+static BuzzerMode buzMode   = BUZ_OFF;
+static constexpr uint16_t BEEP_GAP_MS = 200;
+
+static const BeepStep PAT_LOCK[]   = { {2000,1} };
+static const BeepStep PAT_ARM[]    = { {500,1},{BEEP_GAP_MS,0},{500,1},{BEEP_GAP_MS,0},{2000,1} };
+static const BeepStep PAT_UNLOCK[] = { {3000,1},{BEEP_GAP_MS,0},{500,1},{BEEP_GAP_MS,0},{500,1} };
+
+static const BeepStep* curPat    = nullptr;
+static uint8_t         curPatLen = 0;
+static uint8_t         curIdx    = 0;
+static uint32_t        stepUntil = 0;
+static uint32_t        alarmUntil = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  FORWARD DECLARATIONS
+// ─────────────────────────────────────────────────────────────
+static void gpsPump();
+static bool isGoodFix();
+static bool isInsideBangladesh(double lat, double lon);
+static double distanceMeters(double la1,double lo1,double la2,double lo2);
+static inline float mag3(float x,float y,float z);
+
+static void buzzerOn();
+static void buzzerOff();
+static void buzApply(uint8_t on);
+static void buzzerStartAlarm(uint32_t ms);
+static void buzzerStartPattern(const BeepStep* pat, uint8_t len);
+static void buzzerStopAll();
+static void buzzerUpdate();
+
+static void initIMU();
+static void calibrateGyroBias();
+static void updateImuMotion();
+
+static float getFilteredSpeedKmph_locked();   // call with mutex held
+static bool  isBikeStationary_locked();       // call with mutex held
+static bool  isBikeStationary();              // acquires mutex internally
+
+static void addPoint_locked(double lat,double lon,float spd,DeviceStateId st);
+static void recordSamplePoint();
+static void recordHeartbeatPoint(const __FlashStringHelper* reason);
+static int  buildCompressedTrack(TrackPoint* out, int maxOut,
+                                  const TrackPoint* src, int srcCount);
+
+static void relayOn();
+static void relayOff();
+static void setLed(bool on);
+
+static void executeCommand(const String& cmd, const String& cmdId);
+static void queueReportFromLoop(const char* event, const char* cmdId);
+static DeviceStateId getCurrentState_locked();
+static const char*   stateToString(DeviceStateId st);
+
+static void updateSecurityAlarm();
+static void triggerAlarm(const __FlashStringHelper* reason);
+
+// WiFi / HTTP (Core 0)
+static void wifiMaintenance();
+static bool wifiIsConnected();
+static void internetProbe();
+static bool httpPostJSON(const char* url, const String& json, String* outBody);
+static String jsonFindString(const String& body, const char* key);
+static void pushTrackBatch();
+static void pollCommand();
+static void pumpPendingReport();
+
+// Local portal (Core 1)
+static void localPortalStart();
+static void localPortalStop();
+static void localPortalMaintenance();
+static void localPortalSetupRoutes();
+static void localHandleRoot();
+static void localHandleStatus();
+static void localHandleCmd(const String& cmd);
+static void localHandleNotFound();
+static bool localCheckPinOk();
+
+// Tasks
+static void netTask(void* pv);
+
+// ─────────────────────────────────────────────────────────────
+//  HARDWARE HELPERS  (safe to call from any core)
+// ─────────────────────────────────────────────────────────────
+static void relayOn()  {
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  locked = true;
+  xSemaphoreGive(stateMutex);
+}
+static void relayOff() {
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  locked = false;
+  xSemaphoreGive(stateMutex);
+}
+static void buzzerOn()  { digitalWrite(BUZZER_RELAY_PIN, RELAY_ACTIVE_LOW ? LOW  : HIGH); }
+static void buzzerOff() { digitalWrite(BUZZER_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW); }
+static void setLed(bool on) {
+  if (LED_PIN >= 0)         digitalWrite(LED_PIN, on ? HIGH : LOW);
+  if (ONBOARD_LED_PIN >= 0) digitalWrite(ONBOARD_LED_PIN, on ? HIGH : LOW);
+}
+static inline void buzApply(uint8_t on) { if (on) buzzerOn(); else buzzerOff(); }
+
+// ─────────────────────────────────────────────────────────────
+//  STATE HELPERS
+// ─────────────────────────────────────────────────────────────
+static const char* stateToString(DeviceStateId st) {
+  switch (st) {
+    case ST_LOCKED:   return "LOCKED";
+    case ST_UNLOCKED: return "UNLOCKED";
+    case ST_MOVING:   return "MOVING";
+    case ST_ALARM:    return "ALARM";
+    default:          return "UNLOCKED";
+  }
+}
+
+// Must be called with stateMutex held
+static DeviceStateId getCurrentState_locked() {
+  if (alarmLatched) return ST_ALARM;
+  return locked ? ST_LOCKED : ST_UNLOCKED;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  GPS
+// ─────────────────────────────────────────────────────────────
+static void gpsPump() {
+  while (SerialGPS.available()) gps.encode((char)SerialGPS.read());
+}
+
+static bool isGoodFix() {
+  if (!gps.location.isValid()) return false;
+  if (gps.location.age() > 5000) return false;
+  if (!gps.satellites.isValid() || gps.satellites.value() < 4) return false;
+  if (gps.hdop.isValid() && gps.hdop.hdop() > 3.0) return false;
+  return true;
+}
+
+static bool isInsideBangladesh(double lat, double lon) {
+  return (lat >= 20.0 && lat <= 27.0 && lon >= 88.0 && lon <= 93.0);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MATH UTILS
+// ─────────────────────────────────────────────────────────────
+static inline float mag3(float x, float y, float z) {
+  return sqrtf(x*x + y*y + z*z);
+}
+static inline double deg2rad(double d) { return d * 3.14159265358979323846 / 180.0; }
+
+static double distanceMeters(double la1,double lo1,double la2,double lo2) {
+  const double R = 6371000.0;
+  const double dLat = deg2rad(la2 - la1);
+  const double dLon = deg2rad(lo2 - lo1);
+  const double a = sin(dLat/2)*sin(dLat/2) +
+                   cos(deg2rad(la1))*cos(deg2rad(la2))*sin(dLon/2)*sin(dLon/2);
+  return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  IMU  (Core 1 only — no mutex needed for IMU state)
+// ─────────────────────────────────────────────────────────────
+static void calibrateGyroBias() {
+  float sx=0, sy=0, sz=0;
+  uint16_t ok = 0;
+  for (int i=0; i<40; i++) { imu.Read(); delay(5); }
+  for (uint16_t i=0; i<CAL_SAMPLES; i++) {
+    if (imu.Read()) {
+      sx += imu.gyro_x_radps();
+      sy += imu.gyro_y_radps();
+      sz += imu.gyro_z_radps();
+      ok++;
+    }
+    delay(CAL_DELAY_MS);
+  }
+  if (!ok) { imuBias = {}; imuReady = false; return; }
+  imuBias.x = sx / ok;
+  imuBias.y = sy / ok;
+  imuBias.z = sz / ok;
+}
+
+static void initIMU() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  if (!imu.Begin()) { imuReady = false; return; }
+  imu.ConfigAccelRange(bfs::Mpu6500::ACCEL_RANGE_4G);
+  imu.ConfigGyroRange(bfs::Mpu6500::GYRO_RANGE_500DPS);
+  imu.ConfigDlpfBandwidth(bfs::Mpu6500::DLPF_BANDWIDTH_20HZ);
+  imuReady = true;
+  calibrateGyroBias();
+}
+
+static void updateImuMotion() {
+  if (!imuReady) return;
+  const uint32_t now = millis();
+  if (now - lastImuReadAt < IMU_READ_EVERY_MS) return;
+  lastImuReadAt = now;
+  if (!imu.Read()) return;
+
+  const float ax = imu.accel_x_mps2();
+  const float ay = imu.accel_y_mps2();
+  const float az = imu.accel_z_mps2();
+  const float gx = imu.gyro_x_radps() - imuBias.x;
+  const float gy = imu.gyro_y_radps() - imuBias.y;
+  const float gz = imu.gyro_z_radps() - imuBias.z;
+
+  const float aMag    = mag3(ax, ay, az);
+  const float gMag    = mag3(gx, gy, gz);
+  const float aDeltaG = fabsf(aMag - G_MPS2) / G_MPS2;
+
+  lastADeltaG = aDeltaG;
+  lastGMag    = gMag;
+
+  // Update imuMoving — then write to shared var under mutex
+  bool newMoving = imuMoving;
+  if (!imuMoving) {
+    if ((gMag > GYRO_MOVING_ON) || (aDeltaG > ACCEL_DELTA_ON)) {
+      newMoving = true;
+      imuMovingHoldUntil = now + MOVING_HOLD_MS;
+    }
+  } else {
+    if (now < imuMovingHoldUntil) {
+      // still in hold window
+    } else if ((gMag < GYRO_MOVING_OFF) && (aDeltaG < ACCEL_DELTA_OFF)) {
+      newMoving = false;
+    } else {
+      imuMovingHoldUntil = now + 120;
+    }
+  }
+
+  if (newMoving != imuMoving) {
+    // Short critical section: update shared imuMoving
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      imuMoving = newMoving;
+      xSemaphoreGive(stateMutex);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SPEED FILTER  (mutex-locked variants)
+// ─────────────────────────────────────────────────────────────
+// Must call with stateMutex held
+static float getFilteredSpeedKmph_locked() {
+  if (!gps.speed.isValid() || gps.speed.age() > 3000) {
+    return hasFilteredInit ? filteredSpeed : 0.0f;
+  }
+  const float raw = gps.speed.kmph();
+  if (raw > MAX_SPEED_KMPH) return filteredSpeed;
+
+  if (!hasFilteredInit) {
+    filteredSpeed = raw;
+    hasFilteredInit = true;
+  } else {
+    filteredSpeed = SPEED_ALPHA * raw + (1.0f - SPEED_ALPHA) * filteredSpeed;
+  }
+
+  if (filteredSpeed < MIN_SPEED_KMPH) {
+    if (++lowSpeedCount >= STOP_COUNT_REQ) filteredSpeed = 0.0f;
+  } else {
+    lowSpeedCount = 0;
+  }
+  return filteredSpeed;
+}
+
+// Must call with stateMutex held
+static bool isBikeStationary_locked() {
+  const float spd = getFilteredSpeedKmph_locked();
+  if (!imuReady) return spd < 1.0f;
+  return (!imuMoving && spd < 3.0f);
+}
+
+// Public helper — acquires mutex itself
+static bool isBikeStationary() {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) != pdTRUE) return true;
+  bool s = isBikeStationary_locked();
+  xSemaphoreGive(stateMutex);
+  return s;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TRACK BUFFER  (mutex-protected writes)
+// ─────────────────────────────────────────────────────────────
+// Must call with stateMutex held
+static void addPoint_locked(double lat, double lon, float spd, DeviceStateId st) {
+  TrackPoint tp { lat, lon, spd, millis(), (uint8_t)st };
+  if (rawCount < MAX_RAW_POINTS) {
+    rawBuf[rawCount++] = tp;
+  } else {
+    memmove(rawBuf, rawBuf + 1, (MAX_RAW_POINTS - 1) * sizeof(TrackPoint));
+    rawBuf[MAX_RAW_POINTS - 1] = tp;
+  }
+}
+
+static void recordSamplePoint() {
+  if (!isGoodFix()) return;
+  if (isBikeStationary()) return;
+
+  const double lat = gps.location.lat();
+  const double lon = gps.location.lng();
+  if (!isInsideBangladesh(lat, lon)) return;
+
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+
+  const float spd = getFilteredSpeedKmph_locked();
+  if (spd >= MAX_SPEED_KMPH) { xSemaphoreGive(stateMutex); return; }
+
+  if (rawCount > 0) {
+    const double d = distanceMeters(rawBuf[rawCount-1].lat, rawBuf[rawCount-1].lon, lat, lon);
+    if (d > MAX_JUMP_DIST_M || d < MIN_SAMPLE_DIST_M) {
+      xSemaphoreGive(stateMutex); return;
+    }
+  }
+  addPoint_locked(lat, lon, spd, ST_MOVING);
+  xSemaphoreGive(stateMutex);
+}
+
+static void recordHeartbeatPoint(const __FlashStringHelper* reason) {
+  if (!isGoodFix()) return;
+  const double lat = gps.location.lat();
+  const double lon = gps.location.lng();
+  if (!isInsideBangladesh(lat, lon)) return;
+
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+
+  if (rawCount > 0) {
+    const double d = distanceMeters(rawBuf[rawCount-1].lat, rawBuf[rawCount-1].lon, lat, lon);
+    if (d > MAX_JUMP_DIST_M) { xSemaphoreGive(stateMutex); return; }
+  }
+  DeviceStateId st = getCurrentState_locked();
+  addPoint_locked(lat, lon, 0.0f, st);
+  xSemaphoreGive(stateMutex);
+
+  if (DBG_GPS) { Serial.print(F("[GPS][HB] ")); Serial.println(reason); }
+}
+
+// Compress track — works on a LOCAL copy (no mutex needed)
+static int buildCompressedTrack(TrackPoint* out, int maxOut,
+                                 const TrackPoint* src, int srcCount) {
+  if (!out || maxOut <= 0 || srcCount <= 0) return 0;
+  if (srcCount <= maxOut) {
+    memcpy(out, src, srcCount * sizeof(TrackPoint));
+    return srcCount;
+  }
+  int outCount = 0;
+  out[outCount++] = src[0];
+  int lastIdx = 0;
+  for (int i=1; i<srcCount-1 && outCount < (maxOut-1); i++) {
+    const double d = distanceMeters(src[i].lat, src[i].lon, src[lastIdx].lat, src[lastIdx].lon);
+    if (d >= MIN_SAMPLE_DIST_M) { out[outCount++] = src[i]; lastIdx = i; }
+  }
+  out[outCount++] = src[srcCount-1];
+  return outCount;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  BUZZER ENGINE  (Core 1 only)
+// ─────────────────────────────────────────────────────────────
+static void buzzerStartAlarm(uint32_t durationMs) {
+  buzMode    = BUZ_ALARM;
+  alarmUntil = millis() + durationMs;
+  buzApply(1);
+}
+static void buzzerStartPattern(const BeepStep* pat, uint8_t len) {
+  if (!pat || !len || buzMode == BUZ_ALARM) return;
+  buzMode = BUZ_PATTERN;
+  curPat = pat; curPatLen = len; curIdx = 0;
+  buzApply(curPat[0].on);
+  stepUntil = millis() + curPat[0].ms;
+}
+static void buzzerStopAll() {
+  buzMode = BUZ_OFF;
+  curPat = nullptr; curPatLen = 0; curIdx = 0; alarmUntil = 0;
+  buzApply(0);
+}
+static void buzzerUpdate() {
+  const uint32_t now = millis();
+  if (buzMode == BUZ_ALARM) {
+    if (now >= alarmUntil) buzzerStopAll();
+    return;
+  }
+  if (buzMode == BUZ_PATTERN) {
+    if (now < stepUntil) return;
+    if (++curIdx >= curPatLen) { buzzerStopAll(); return; }
+    buzApply(curPat[curIdx].on);
+    stepUntil = now + curPat[curIdx].ms;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  REPORT QUEUE  (loop → netTask)
+// ─────────────────────────────────────────────────────────────
+static void queueReportFromLoop(const char* event, const char* cmdId) {
+  ReportMsg msg;
+  strncpy(msg.event, event, sizeof(msg.event) - 1); msg.event[sizeof(msg.event)-1] = 0;
+  strncpy(msg.cmdId, cmdId ? cmdId : "", sizeof(msg.cmdId) - 1); msg.cmdId[sizeof(msg.cmdId)-1] = 0;
+  xQueueSend(reportQueue, &msg, 0);  // non-blocking, drop if full
+}
+
+// ─────────────────────────────────────────────────────────────
+//  COMMAND EXECUTION  (Core 1 only — called from loop())
+// ─────────────────────────────────────────────────────────────
+static void executeCommand(const String& cmd, const String& cmdId) {
+  if (cmd != "BUZZ") buzzerStopAll();
+
+  if (cmd == "LOCK") {
+    buzzerStartPattern(PAT_LOCK, (uint8_t)(sizeof(PAT_LOCK)/sizeof(PAT_LOCK[0])));
+    relayOn();
+    setLed(false);
+    queueReportFromLoop("LOCK_DONE", cmdId.c_str());
+    return;
+  }
+  if (cmd == "UNLOCK") {
+    relayOff();
+    setLed(true);
+    // Clear security state under mutex
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    armed        = false;
+    alarmLatched = false;
+    xSemaphoreGive(stateMutex);
+    knockCount = 0; tamperMotionSince = 0; touchSince = 0;
+    buzzerStartPattern(PAT_UNLOCK, (uint8_t)(sizeof(PAT_UNLOCK)/sizeof(PAT_UNLOCK[0])));
+    queueReportFromLoop("UNLOCK_DONE", cmdId.c_str());
+    return;
+  }
+  if (cmd == "ARM") {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    bool isLocked = locked;
+    xSemaphoreGive(stateMutex);
+    if (!isLocked) { queueReportFromLoop("ARM_REJECT_UNLOCKED", cmdId.c_str()); return; }
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    armed = true; alarmLatched = false;
+    xSemaphoreGive(stateMutex);
+    knockCount = 0; tamperMotionSince = 0; touchSince = 0;
+    buzzerStartPattern(PAT_ARM, (uint8_t)(sizeof(PAT_ARM)/sizeof(PAT_ARM[0])));
+    queueReportFromLoop("ARM_ON", cmdId.c_str());
+    return;
+  }
+  if (cmd == "BUZZ") {
+    buzzerStartAlarm(ALARM_BUZZ_MS);
+    queueReportFromLoop("BUZZ_ON", cmdId.c_str());
+    return;
+  }
+  queueReportFromLoop("UNKNOWN_CMD", cmdId.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SECURITY ALARM  (Core 1 only)
+// ─────────────────────────────────────────────────────────────
+static void triggerAlarm(const __FlashStringHelper* reason) {
+  const uint32_t now = millis();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  const bool inCooldown = (now < alarmCooldownUntil);
+  if (!inCooldown) {
+    alarmLatched = true;
+    alarmCooldownUntil = now + ALARM_COOLDOWN_MS;
+  }
+  xSemaphoreGive(stateMutex);
+  if (inCooldown) return;
+
+  buzzerStartAlarm(ALARM_BUZZ_MS);
+  if (DBG_SEC) { Serial.print(F("[SEC] ALARM: ")); Serial.println(reason); }
+  queueReportFromLoop("ALARM_TRIGGERED", "");
+}
+
+static void updateSecurityAlarm() {
+  if (!imuReady) return;
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  bool isArmed  = armed;
+  bool isLocked = locked;
+  xSemaphoreGive(stateMutex);
+
+  if (!isArmed || !isLocked) return;
+
+  // Speed check (read-only GPS, no mutex needed — TinyGPSPlus is Core 1 only)
+  const bool spdValid = gps.speed.isValid() && (gps.speed.age() <= 3000);
+  const float spd = spdValid ? gps.speed.kmph() : 0.0f;
+  if (spdValid && spd >= 2.0f) {
+    knockCount = 0; tamperMotionSince = 0; touchSince = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  // Touch detection (very light vibration)
+  const bool touchNow = (lastADeltaG > TOUCH_DELTA_G) || (lastGMag > TOUCH_GYRO);
+  if (touchNow) {
+    if (!touchSince) touchSince = now;
+    if ((now - touchSince >= TOUCH_TRIGGER_MS) && (now - lastTouchFireAt >= TOUCH_DEBOUNCE_MS)) {
+      lastTouchFireAt = now;
+      touchSince = 0;
+      triggerAlarm(F("TOUCH"));
+      return;
+    }
+  } else {
+    touchSince = 0;
+  }
+
+  // Knock detection
+  const bool hit = (lastADeltaG > KNOCK_DELTA_G) || (lastGMag > KNOCK_GYRO);
+  if (hit && (now - lastKnockAt >= KNOCK_DEBOUNCE_MS)) {
+    lastKnockAt = now;
+    if (!knockCount) firstKnockAt = now;
+    if (++knockCount >= KNOCK_COUNT_REQ && (now - firstKnockAt <= KNOCK_WINDOW_MS)) {
+      knockCount = 0;
+      triggerAlarm(F("KNOCK"));
+      return;
+    }
+  }
+  if (knockCount && (now - firstKnockAt > KNOCK_WINDOW_MS)) knockCount = 0;
+
+  // Sustained motion detection
+  const bool motionNow = (lastADeltaG > 0.10f) || (lastGMag > 0.35f) || imuMoving;
+  if (motionNow) {
+    if (!tamperMotionSince) tamperMotionSince = now;
+    if (now - tamperMotionSince >= TAMPER_MOTION_MS) {
+      tamperMotionSince = 0;
+      triggerAlarm(F("SUSTAINED MOTION"));
+      return;
+    }
+  } else {
+    tamperMotionSince = 0;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOCAL PORTAL HTML  (stored in flash — PROGMEM)
+// ─────────────────────────────────────────────────────────────
+// Stored in PROGMEM to keep it out of DRAM heap on read.
+// Use localServer.send_P() for zero-copy serving.
+static const char HTML_PAGE[] PROGMEM =
+  "<!doctype html><html><head><meta charset='utf-8'/>"
+  "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+  "<title>Bike Local</title>"
+  "<style>"
+  ":root{--bg:#0b1220;--card:#0f172a;--line:rgba(255,255,255,.10);--muted:#94a3b8;--txt:#e5e7eb;"
+  "--ok:#22c55e;--bad:#ef4444;--warn:#f97316}"
+  "*{box-sizing:border-box}"
+  "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;"
+  "background:radial-gradient(900px 480px at 10% 10%,rgba(34,197,94,.14),transparent 60%),"
+  "radial-gradient(900px 480px at 90% 0%,rgba(249,115,22,.14),transparent 55%),var(--bg);"
+  "color:var(--txt)}"
+  ".wrap{max-width:860px;margin:0 auto;padding:18px}"
+  ".top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;"
+  "margin-bottom:10px;flex-wrap:wrap}"
+  ".title{font-size:16px;font-weight:900;letter-spacing:.2px}"
+  ".grid{display:grid;grid-template-columns:1.15fr .85fr;gap:12px}"
+  "@media(max-width:860px){.grid{grid-template-columns:1fr}}"
+  ".card{background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));"
+  "border:1px solid var(--line);border-radius:16px;padding:14px;"
+  "box-shadow:0 10px 30px rgba(0,0,0,.25)}"
+  ".kv{display:grid;grid-template-columns:140px 1fr;gap:8px;font-size:13px}"
+  ".k{color:var(--muted)}.v{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+  ".chips{display:flex;flex-wrap:wrap;gap:8px}"
+  ".chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;"
+  "border:1px solid var(--line);background:rgba(255,255,255,.03);font-size:12px}"
+  ".dot{width:8px;height:8px;border-radius:50%}"
+  ".dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}"
+  "label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}"
+  "input{width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);"
+  "background:rgba(0,0,0,.22);color:var(--txt);outline:none}"
+  "input:focus{border-color:rgba(34,197,94,.55);box-shadow:0 0 0 3px rgba(34,197,94,.16)}"
+  ".row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}"
+  "button{flex:1;min-width:140px;padding:12px 14px;border-radius:14px;"
+  "border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);"
+  "color:var(--txt);font-weight:900;cursor:pointer;transition:transform .06s,filter .12s,opacity .12s}"
+  "button:active{transform:translateY(1px)}"
+  "button.primary{background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.35)}"
+  "button.danger{background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.35)}"
+  "button.warn{background:rgba(249,115,22,.18);border-color:rgba(249,115,22,.35)}"
+  "button.gray{background:rgba(51,65,85,.22);border-color:rgba(51,65,85,.35)}"
+  "button:hover{filter:brightness(1.06)}"
+  "button[disabled]{opacity:.45;cursor:not-allowed;filter:none;transform:none}"
+  ".msg{margin-top:10px;color:var(--muted);font-size:12px;min-height:18px}"
+  ".banner{display:none;margin-top:10px;padding:10px 12px;border-radius:14px;"
+  "border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.12);font-size:12px}"
+  ".banner.show{display:block}"
+  ".muteWrap{display:none;margin-top:10px}.muteWrap.show{display:block}"
+  "</style></head><body><div class='wrap'>"
+  "<div class='top'>"
+    "<div class='title'>&#x1F6B2; Bike Local Control</div>"
+    "<div class='chips'>"
+      "<span class='chip' id='chipWifi'><span class='dot bad'></span><span>Wi-Fi</span><b id='wifiTxt'>OFF</b></span>"
+      "<span class='chip' id='chipNet'><span class='dot bad'></span><span>Internet</span><b id='netTxt'>BAD</b></span>"
+      "<span class='chip' id='chipVib'><span class='dot bad'></span><span>Vibe</span><b id='vibTxt'>OFF</b></span>"
+    "</div>"
+  "</div>"
+  "<div class='grid'>"
+    "<div class='card'>"
+      "<div class='kv'>"
+        "<div class='k'>State</div><div class='v' id='st'>-</div>"
+        "<div class='k'>Locked</div><div class='v' id='locked'>-</div>"
+        "<div class='k'>Armed</div><div class='v' id='armed'>-</div>"
+        "<div class='k'>Alarm</div><div class='v' id='alarm'>-</div>"
+        "<div class='k'>GPS</div><div class='v' id='gps'>-</div>"
+        "<div class='k'>Speed</div><div class='v' id='spd'>-</div>"
+        "<div class='k'>IMU</div><div class='v' id='imu'>-</div>"
+        "<div class='k'>Buffer</div><div class='v' id='buf'>-</div>"
+      "</div>"
+      "<div class='banner' id='alarmBanner'>Alarm active. Use <b>UNLOCK</b> to stop.</div>"
+      "<div class='muteWrap' id='muteWrap'>"
+        "<div class='row'>"
+          "<button class='gray' id='btnMuteVibe' type='button'>STOP VIBRATION</button>"
+        "</div>"
+      "</div>"
+    "</div>"
+    "<div class='card'>"
+      "<label>4-digit PIN</label>"
+      "<input id='pin' inputmode='numeric' maxlength='4' placeholder='****'/>"
+      "<div class='row'>"
+        "<button id='btnLock' class='danger' onclick=\"sendCmd('lock')\">LOCK</button>"
+        "<button id='btnUnlock' class='primary' onclick=\"sendCmd('unlock')\">UNLOCK</button>"
+        "<button id='btnArm' class='warn' onclick=\"sendCmd('arm')\">ARM</button>"
+        "<button id='btnBuzz' class='gray' onclick=\"sendCmd('buzz')\">BUZZ</button>"
+      "</div>"
+      "<div class='msg' id='msg'></div>"
+    "</div>"
+  "</div>"
+  "<script>"
+  "function setChip(id,mode){const e=document.getElementById(id);const d=e.querySelector('.dot');"
+  "d.className='dot '+(mode==='ok'?'ok':mode==='warn'?'warn':'bad');}"
+  "let alarmOn=false,vibMuted=false,vibOk=false,vibTimer=0,vibFailAt=0;"
+  "function vibUI(){const t=document.getElementById('vibTxt');"
+  "if(!navigator.vibrate){t.textContent='N/A';setChip('chipVib','bad');return;}"
+  "if(!alarmOn){t.textContent='OFF';setChip('chipVib','bad');return;}"
+  "if(vibMuted){t.textContent='MUTED';setChip('chipVib','warn');return;}"
+  "t.textContent=vibOk?'ON':'AUTO';setChip('chipVib',vibOk?'ok':'warn');}"
+  "function vibKick(){vibOk=!!navigator.vibrate(300);"
+  "if(!vibOk){if(!vibFailAt)vibFailAt=Date.now();}else{vibFailAt=0;"
+  "const m=document.getElementById('msg');"
+  "if(m.textContent==='Tap screen to allow vibration.')m.textContent='';}"
+  "vibUI();vibTimer=setTimeout(vibKick,450);"
+  "if(alarmOn&&!vibMuted&&vibFailAt&&(Date.now()-vibFailAt>1500)){"
+  "const m=document.getElementById('msg');"
+  "if(!m.textContent)m.textContent='Tap screen to allow vibration.';}}"
+  "function startVibeLoop(){if(!alarmOn||vibMuted||vibTimer||!navigator.vibrate)"
+  "{vibOk=false;vibUI();return;}navigator.vibrate(60);vibKick();}"
+  "function stopVibeLoop(){if(vibTimer){clearTimeout(vibTimer);vibTimer=0;}"
+  "if(navigator.vibrate)navigator.vibrate(0);vibOk=false;vibFailAt=0;vibUI();}"
+  "document.getElementById('btnMuteVibe').addEventListener('click',()=>{"
+  "vibMuted=true;stopVibeLoop();"
+  "document.getElementById('msg').textContent='Vibration muted.';"
+  "document.getElementById('btnMuteVibe').disabled=true;vibUI();});"
+  "window.addEventListener('pointerdown',()=>{"
+  "if(alarmOn&&!vibMuted&&!vibTimer)startVibeLoop();},{passive:true});"
+  "async function refresh(){try{"
+  "const r=await fetch('/status',{cache:'no-store'});"
+  "const j=await r.json();"
+  "document.getElementById('wifiTxt').textContent=j.wifi?'ON':'OFF';"
+  "document.getElementById('netTxt').textContent=j.net?'OK':'BAD';"
+  "setChip('chipWifi',j.wifi?'ok':'bad');setChip('chipNet',j.net?'ok':'bad');"
+  "document.getElementById('st').textContent=j.state||'-';"
+  "document.getElementById('locked').innerHTML=j.locked?"
+  "'<b style=color:var(--bad)>YES</b>':'<b style=color:var(--ok)>NO</b>';"
+  "document.getElementById('armed').innerHTML=j.armed?"
+  "'<b style=color:var(--warn)>YES</b>':'<b style=color:var(--ok)>NO</b>';"
+  "document.getElementById('alarm').innerHTML=j.alarm?"
+  "'<b style=color:var(--bad)>YES</b>':'<b style=color:var(--ok)>NO</b>';"
+  "document.getElementById('gps').textContent=j.gps||'-';"
+  "document.getElementById('spd').textContent=j.speed||'-';"
+  "document.getElementById('imu').textContent=j.imu||'-';"
+  "document.getElementById('buf').textContent=j.buf||'-';"
+  "const lk=!!j.locked,ar=!!j.armed,al=!!j.alarm;"
+  "document.getElementById('btnLock').style.display=(!lk&&!al)?'':'none';"
+  "document.getElementById('btnUnlock').style.display=(lk||al)?'':'none';"
+  "document.getElementById('btnArm').style.display=lk?'':'none';"
+  "document.getElementById('btnArm').disabled=ar;"
+  "document.getElementById('btnArm').textContent=ar?'ARMED':'ARM';"
+  "if(al){alarmOn=true;"
+  "document.getElementById('alarmBanner').className='banner show';"
+  "document.getElementById('muteWrap').className='muteWrap show';"
+  "document.getElementById('btnMuteVibe').disabled=vibMuted;"
+  "if(!vibMuted)startVibeLoop();"
+  "}else{alarmOn=false;vibMuted=false;stopVibeLoop();"
+  "document.getElementById('alarmBanner').className='banner';"
+  "document.getElementById('muteWrap').className='muteWrap';}"
+  "vibUI();}catch(e){}}"
+  "async function sendCmd(c){const p=document.getElementById('pin').value||'';"
+  "document.getElementById('msg').textContent='Sending...';"
+  "try{const r=await fetch('/api/'+c+'?pin='+encodeURIComponent(p),{method:'POST'});"
+  "const t=await r.text();document.getElementById('msg').textContent=t;refresh();"
+  "}catch(e){document.getElementById('msg').textContent='ERR';}}"
+  "vibUI();setInterval(refresh,1200);refresh();"
+  "</script></div></body></html>";
+
+// ─────────────────────────────────────────────────────────────
+//  LOCAL PORTAL HANDLERS  (Core 1)
+// ─────────────────────────────────────────────────────────────
+static bool localCheckPinOk() {
+  const uint32_t now = millis();
+  if (now < localPinLockedUntil) return false;
+
+  String pin = localServer.arg("pin");
+  if (!pin.length()) pin = localServer.arg("p");
+
+  if (pin != LOCAL_PIN) {
+    if (++localPinFailCount >= LOCAL_PIN_FAIL_MAX) {
+      localPinFailCount = 0;
+      localPinLockedUntil = now + LOCAL_PIN_LOCK_MS;
+    }
+    return false;
+  }
+  localPinFailCount  = 0;
+  localPinLockedUntil = 0;
+  return true;
+}
+
+static void localHandleRoot() {
+  localApLastActivityAt = millis();
+  // send_P reads directly from flash — no heap copy of the 4 KB HTML
+  localServer.send_P(200, "text/html", HTML_PAGE);
+}
+
+static void localHandleStatus() {
+  localApLastActivityAt = millis();
+
+  // Snapshot shared state under mutex
+  bool   sLocked, sArmed, sAlarm, sWifi, sNet;
+  float  sDeltaG, sGMag;
+  bool   sImuMoving, sImuReady;
+  int    sBufCount;
+  DeviceStateId sSt;
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  sLocked    = locked;
+  sArmed     = armed;
+  sAlarm     = alarmLatched;
+  sDeltaG    = lastADeltaG;
+  sGMag      = lastGMag;
+  sImuMoving = imuMoving;
+  sBufCount  = rawCount;
+  sSt        = getCurrentState_locked();
+  xSemaphoreGive(stateMutex);
+
+  sImuReady = imuReady;
+  sWifi     = (WiFi.status() == WL_CONNECTED);
+  sNet      = (bool)gInternetOk;
+
+  char gpsStr[80];
+  snprintf(gpsStr, sizeof(gpsStr), "%s age=%lu sats=%d hdop=%.1f",
+    gps.location.isValid() ? "valid" : "no",
+    (unsigned long)gps.location.age(),
+    gps.satellites.isValid() ? (int)gps.satellites.value() : -1,
+    gps.hdop.isValid() ? (double)gps.hdop.hdop() : -1.0);
+
+  char spdStr[30];
+  snprintf(spdStr, sizeof(spdStr), "%.1f km/h",
+    gps.speed.isValid() ? (double)gps.speed.kmph() : -1.0);
+
+  char imuStr[60];
+  snprintf(imuStr, sizeof(imuStr), "%s moving=%d dG=%.3f g=%.3f",
+    sImuReady ? "ok" : "off", (int)sImuMoving, (double)sDeltaG, (double)sGMag);
+
+  String out;
+  out.reserve(450);
+  out += F("{\"state\":\"");    out += stateToString(sSt);             out += F("\",");
+  out += F("\"locked\":");      out += sLocked  ? "true" : "false";   out += F(",");
+  out += F("\"armed\":");       out += sArmed   ? "true" : "false";   out += F(",");
+  out += F("\"alarm\":");       out += sAlarm   ? "true" : "false";   out += F(",");
+  out += F("\"wifi\":");        out += sWifi    ? "true" : "false";   out += F(",");
+  out += F("\"net\":");         out += sNet     ? "true" : "false";   out += F(",");
+  out += F("\"gps\":\"");       out += gpsStr;                         out += F("\",");
+  out += F("\"speed\":\"");     out += spdStr;                         out += F("\",");
+  out += F("\"imu\":\"");       out += imuStr;                         out += F("\",");
+  out += F("\"buf\":\"");       out += sBufCount;                      out += F(" raw\"}");
+
+  localServer.send(200, "application/json", out);
+}
+
+static void localHandleCmd(const String& cmd) {
+  localApLastActivityAt = millis();
+  if (millis() < localPinLockedUntil) {
+    localServer.send(429, "text/plain", "PIN LOCKED - WAIT");
+    return;
+  }
+  if (!localCheckPinOk()) {
+    localServer.send(401, "text/plain", "BAD PIN");
+    return;
+  }
+  executeCommand(cmd, "LOCAL");
+  localServer.send(200, "text/plain", "OK");
+}
+
+static void localHandleNotFound() {
+  localApLastActivityAt = millis();
+  // Redirect to portal root (captive portal behaviour)
+  String loc = "http://";
+  loc += WiFi.softAPIP().toString();
+  loc += "/";
+  localServer.sendHeader("Location", loc, true);
+  localServer.send(302, "text/plain", "");
+}
+
+static void localPortalSetupRoutes() {
+  localServer.on("/",          HTTP_ANY, localHandleRoot);
+  localServer.on("/status",    HTTP_ANY, localHandleStatus);
+  localServer.on("/api/lock",  HTTP_ANY, []{ localHandleCmd("LOCK"); });
+  localServer.on("/api/unlock",HTTP_ANY, []{ localHandleCmd("UNLOCK"); });
+  localServer.on("/api/arm",   HTTP_ANY, []{ localHandleCmd("ARM"); });
+  localServer.on("/api/buzz",  HTTP_ANY, []{ localHandleCmd("BUZZ"); });
+  // Captive portal intercept paths
+  localServer.on("/generate_204",         HTTP_ANY, localHandleRoot);
+  localServer.on("/gen_204",              HTTP_ANY, localHandleRoot);
+  localServer.on("/hotspot-detect.html",  HTTP_ANY, localHandleRoot);
+  localServer.on("/connecttest.txt",      HTTP_ANY, localHandleRoot);
+  localServer.on("/ncsi.txt",             HTTP_ANY, localHandleRoot);
+  localServer.onNotFound(localHandleNotFound);
+}
+
+static void localPortalStart() {
+  if (localApActive) return;
+
+  // AP is already up (WIFI_AP_STA set in setup), just start server
+  localApLastActivityAt = millis();
+
+  IPAddress ip = WiFi.softAPIP();
+  localDns.start(53, "*", ip);
+  localPortalSetupRoutes();
+  localServer.begin();
+  localApActive = true;
+
+  if (DBG_LOCAL) {
+    char ssid[40]; WiFi.softAPSSID().toCharArray(ssid, sizeof(ssid));
+    Serial.printf("[LOCAL] Portal ON  ssid=%s  ip=%s\n", ssid, ip.toString().c_str());
+  }
+}
+
+static void localPortalStop() {
+  if (!localApActive) return;
+  localServer.stop();
+  localDns.stop();
+  localApActive = false;
+  localApLastActivityAt = 0;
+  if (DBG_LOCAL) Serial.println(F("[LOCAL] Portal OFF"));
+}
+
+static void localPortalMaintenance() {
+  // This runs on Core 1 — always fast, never blocked by HTTP
+  if (!localApActive) return;
+
+  localDns.processNextRequest();
+  localServer.handleClient();   // ← key: always gets CPU time
+
+  // Auto-stop portal after 5 min with no clients
+  static constexpr uint32_t IDLE_OFF_MS = 5UL * 60UL * 1000UL;
+  const uint32_t now = millis();
+  const int clients = WiFi.softAPgetStationNum();
+  if (clients > 0) localApLastActivityAt = now;
+  if (clients == 0 && (now - localApLastActivityAt >= IDLE_OFF_MS)) {
+    localPortalStop();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  WIFI / NET  (Core 0 — netTask)
+// ─────────────────────────────────────────────────────────────
+static bool wifiIsConnected() { return WiFi.status() == WL_CONNECTED; }
+
+static void netOnSuccess() {
+  netFailStreak = 0;
+  netBackoffMs  = 15000;
+  nextNetTryAt  = millis();
+}
+static void netOnFail() {
+  netFailStreak++;
+  uint32_t next = netBackoffMs * 2;
+  netBackoffMs  = min(next, (uint32_t)NET_BACKOFF_MAX_MS);
+  nextNetTryAt  = millis() + netBackoffMs;
+  if (DBG_NET) Serial.printf("[WIFI] backoff %lu ms streak=%d\n", (unsigned long)netBackoffMs, netFailStreak);
+}
+
+static void wifiMaintenance() {
+  const bool connected = wifiIsConnected();
+
+  if (connected) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      wifiConnecting   = false;
+      netOnSuccess();
+      if (DBG_NET) Serial.printf("[WIFI] connected  IP=%s\n", WiFi.localIP().toString().c_str());
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    wifiConnecting   = false;
+    netBackoffMs     = 15000;
+    nextNetTryAt     = millis();
+    if (DBG_NET) Serial.println(F("[WIFI] disconnected"));
+  }
+
+  if (wifiConnecting) {
+    if (millis() - wifiConnectStartedAt >= WIFI_CONNECT_TIMEOUT_MS) {
+      wifiConnecting = false;
+      netOnFail();
+      WiFi.disconnect(false, false);
+      if (DBG_NET) Serial.println(F("[WIFI] connect timeout"));
+    }
+    return;
+  }
+
+  if (millis() >= nextNetTryAt) {
+    if (DBG_NET) Serial.printf("[WIFI] connect → %s\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    wifiConnecting       = true;
+    wifiConnectStartedAt = millis();
+  }
+}
+
+static void internetProbe() {
+  // Runs inside netTask — blocking DNS + TCP is fine here
+  const uint32_t now = millis();
+  if (now - lastNetCheckAt < NET_CHECK_EVERY_MS) {
+    gInternetOk = (lastInternetOkAt != 0) && (now - lastInternetOkAt < NET_OK_TTL_MS);
+    return;
+  }
+  lastNetCheckAt = now;
+
+  if (!wifiIsConnected()) { gInternetOk = false; lastInternetOkAt = 0; return; }
+
+  IPAddress ip;
+  bool ok = WiFi.hostByName("smartbike.ashikdev.com", ip);
+  if (ok) {
+    WiFiClient c;
+    c.setTimeout(1500);
+    ok = c.connect(ip, 80);
+    c.stop();
+  }
+  if (ok) lastInternetOkAt = now;
+  gInternetOk = ok;
+  if (DBG_NET) Serial.printf("[NET] probe=%s\n", ok ? "OK" : "FAIL");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HTTP  (Core 0 — netTask)
+// ─────────────────────────────────────────────────────────────
+static bool httpPostJSON(const char* url, const String& json, String* outBody) {
+  if (!wifiIsConnected()) return false;
+
+  WiFiClient client;
+  client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+  http.useHTTP10(true);
+
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+
+  if (DBG_NET) Serial.printf("[HTTP] POST %s\n", url);
+
+  const int code = http.POST((uint8_t*)json.c_str(), json.length());
+  if (code <= 0) {
+    if (DBG_NET) Serial.printf("[HTTP] fail code=%d\n", code);
+    http.end();
+    return false;
+  }
+
+  if (outBody) {
+    *outBody = http.getString();
+    if (outBody->length() > 2048) outBody->remove(2048);
+    if (DBG_HTTP_BODY) { Serial.print(F("[HTTP] body=")); Serial.println(*outBody); }
+  }
+  if (DBG_NET) Serial.printf("[HTTP] status=%d\n", code);
+
+  http.end();
+  return (code >= 200 && code < 300);
+}
+
+static String jsonFindString(const String& body, const char* key) {
+  const String k = String('"') + key + '"';
+  const int p = body.indexOf(k);
+  if (p < 0) return "";
+  const int colon = body.indexOf(':', p);
+  if (colon < 0) return "";
+  // Check for null
+  const int nullPos = body.indexOf("null", colon);
+  if (nullPos >= 0 && nullPos - colon < 12) return "null";
+  const int q1 = body.indexOf('"', colon);
+  if (q1 < 0) return "";
+  const int q2 = body.indexOf('"', q1 + 1);
+  if (q2 < 0) return "";
+  return body.substring(q1 + 1, q2);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NET TASK ACTIONS  (Core 0)
+// ─────────────────────────────────────────────────────────────
+static void pumpPendingReport() {
+  // First drain queue from loop()
+  ReportMsg rmsg;
+  while (xQueueReceive(reportQueue, &rmsg, 0) == pdTRUE) {
+    // Overwrite pending (latest event wins — simplify, no queue here)
+    pendingReport = true;
+    strncpy(pendingReportEvent, rmsg.event, sizeof(pendingReportEvent)-1);
+    strncpy(pendingReportCmdId, rmsg.cmdId, sizeof(pendingReportCmdId)-1);
+    lastReportTry = 0; // retry immediately
+  }
+
+  if (!pendingReport || !wifiIsConnected()) return;
+  const uint32_t now = millis();
+  if (now - lastReportTry < REPORT_RETRY_MS) return;
+  lastReportTry = now;
+
+  String json;
+  json.reserve(200);
+  json += F("{\"deviceId\":\"");  json += DEVICE_ID; json += F("\",");
+  if (pendingReportCmdId[0] && strcmp(pendingReportCmdId,"null") != 0) {
+    json += F("\"commandId\":\""); json += pendingReportCmdId; json += F("\",");
+  }
+  json += F("\"event\":\"");     json += pendingReportEvent; json += F("\"}");
+
+  if (httpPostJSON(SERVER_URL_REPORT, json, nullptr)) {
+    pendingReport = false;
+    pendingReportEvent[0] = 0;
+    pendingReportCmdId[0] = 0;
+  }
+}
+
+static void pushTrackBatch() {
+  if (!wifiIsConnected()) return;
+
+  // --- Snapshot rawBuf under mutex (brief critical section) ---
+  TrackPoint localBuf[MAX_RAW_POINTS];
+  int        localCount = 0;
+  bool       localAlarm, localLocked, localMoving;
+
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  localCount  = rawCount;
+  localAlarm  = alarmLatched;
+  localLocked = locked;
+  localMoving = imuMoving;
+  if (localCount > 0)
+    memcpy(localBuf, rawBuf, localCount * sizeof(TrackPoint));
+  xSemaphoreGive(stateMutex);
+  // --- End of critical section ---
+
+  if (localCount == 0) return;
+
+  // Determine top-level state from snapshot
+  DeviceStateId topSt = localAlarm ? ST_ALARM :
+                        (localMoving ? ST_MOVING :
+                         (localLocked ? ST_LOCKED : ST_UNLOCKED));
+
+  // Build compressed track from local copy
+  TrackPoint track[MAX_TRACK_POINTS];
+  const int n = buildCompressedTrack(track, MAX_TRACK_POINTS, localBuf, localCount);
+  if (n <= 0) return;
+
+  String json;
+  json.reserve(820);
+  json += F("{\"deviceId\":\""); json += DEVICE_ID;            json += F("\",");
+  json += F("\"state\":\"");     json += stateToString(topSt); json += F("\",");
+  json += F("\"track\":[");
+
+  for (int i=0; i<n; i++) {
+    if (i) json += ',';
+    json += F("{\"lat\":");   json += String(track[i].lat, 6);
+    json += F(",\"lon\":");   json += String(track[i].lon, 6);
+    json += F(",\"speed\":"); json += String(track[i].speed, 2);
+    json += F(",\"state\":\""); json += stateToString((DeviceStateId)track[i].st);
+    json += F("\"}");
+  }
+  json += F("]}");
+
+  const bool ok = httpPostJSON(SERVER_URL_PUSH, json, nullptr);
+
+  if (ok) {
+    // Clear ONLY the points we successfully sent
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    if (rawCount >= localCount) {
+      const int remaining = rawCount - localCount;
+      if (remaining > 0)
+        memmove(rawBuf, rawBuf + localCount, remaining * sizeof(TrackPoint));
+      rawCount = remaining;
+    }
+    xSemaphoreGive(stateMutex);
+  } else {
+    Serial.println(F("[PUSH] failed, keeping buffer"));
+  }
+}
+
+static void pollCommand() {
+  if (!wifiIsConnected()) return;
+
+  String json;
+  json.reserve(48);
+  json += F("{\"deviceId\":\""); json += DEVICE_ID; json += F("\"}");
+
+  String body;
+  if (!httpPostJSON(SERVER_URL_POLL, json, &body)) return;
+
+  const String command   = jsonFindString(body, "command");
+  const String commandId = jsonFindString(body, "commandId");
+  if (!command.length() || command == "null") return;
+
+  // Push to cmdQueue — loop() will execute it on Core 1
+  CmdMsg msg;
+  command.toCharArray(msg.cmd, sizeof(msg.cmd));
+  commandId.toCharArray(msg.cmdId, sizeof(msg.cmdId));
+  if (xQueueSend(cmdQueue, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+    Serial.println(F("[NET] cmdQueue full, dropped"));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NET TASK  (Core 0)
+// ─────────────────────────────────────────────────────────────
+static void netTask(void* pv) {
+  // Small startup delay so setup() can finish
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  // Timers (local to this task — no mutex needed)
+  uint32_t lastPushLocal = 0;
+  uint32_t lastPollLocal = 0;
+
+  for (;;) {
+    wifiMaintenance();
+    internetProbe();
+    pumpPendingReport();
+
+    // Snapshot moving/still status for interval selection
+    bool still = isBikeStationary();  // acquires mutex internally
+    bool noNet = !wifiIsConnected() || !gInternetOk;
+
+    // ------ Push ------
+    const uint32_t pushInterval =
+      noNet  ? PUSH_INTERVAL_NONET_MS  :
+      still  ? PUSH_INTERVAL_STILL_MS  : PUSH_INTERVAL_MOVING_MS;
+
+    if (millis() - lastPushLocal >= pushInterval) {
+      lastPushLocal = millis();
+      pushTrackBatch();
+    }
+
+    // ------ Poll ------
+    bool fastPoll;
+    {
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      fastPoll = armed || alarmLatched;
+      xSemaphoreGive(stateMutex);
+    }
+    const uint32_t pollInterval =
+      noNet    ? POLL_INTERVAL_NONET_MS :
+      fastPoll ? POLL_INTERVAL_FAST_MS  : POLL_INTERVAL_NORMAL_MS;
+
+    if (millis() - lastPollLocal >= pollInterval) {
+      lastPollLocal = millis();
+      pollCommand();
+    }
+
+    // Yield CPU to WiFi stack and other tasks
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(600);
+  Serial.println(F("\n=== SmartBike v8.0  Deep Recharge ==="));
+
+  // Disable Bluetooth to free RAM (~100 KB)
+  btStop();
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+
+  // GPIO init
+  pinMode(RELAY_PIN,        OUTPUT);
+  pinMode(BUZZER_RELAY_PIN, OUTPUT);
+  if (LED_PIN >= 0)         pinMode(LED_PIN, OUTPUT);
+  if (ONBOARD_LED_PIN >= 0) pinMode(ONBOARD_LED_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN,        RELAY_ACTIVE_LOW ? HIGH : LOW);  // relay off
+  digitalWrite(BUZZER_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);  // buzzer off
+  setLed(false);
+
+  // GPS
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // IMU (on Core 1, before tasks start)
+  initIMU();
+
+  // ── WiFi: start in AP_STA mode once — never change again ──
+  // STA = connects to home router for internet
+  // AP  = always-on local portal (BIKE01-LOCAL)
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);  // We manage reconnect ourselves
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+
+  char apSsid[40];
+  snprintf(apSsid, sizeof(apSsid), "%s-LOCAL", DEVICE_ID);
+  WiFi.softAP(apSsid, LOCAL_AP_PASS);
+  delay(100);
+
+  Serial.printf("[WIFI] AP SSID=%s  IP=%s\n",
+    apSsid, WiFi.softAPIP().toString().c_str());
+
+  // Start local portal immediately (AP is already up)
+  localPortalStart();
+
+  // ── FreeRTOS primitives ──
+  stateMutex  = xSemaphoreCreateMutex();
+  cmdQueue    = xQueueCreate(4, sizeof(CmdMsg));
+  reportQueue = xQueueCreate(8, sizeof(ReportMsg));
+
+  configASSERT(stateMutex);
+  configASSERT(cmdQueue);
+  configASSERT(reportQueue);
+
+  // ── Spawn network task on Core 0, priority 2 ──
+  xTaskCreatePinnedToCore(
+    netTask,
+    "netTask",
+    8192,           // stack words (~32 KB)
+    nullptr,
+    2,              // priority: higher than Arduino loop (1)
+    &netTaskHandle,
+    0               // Core 0
+  );
+
+  // ── Timestamps ──
+  const uint32_t now = millis();
+  lastSample    = now;
+  lastHeartbeat = now;
+
+  Serial.println(F("=== Setup done — Core 1 running ==="));
+  Serial.printf("[HEAP] free=%d\n", esp_get_free_heap_size());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP  (Core 1 — NEVER blocks on network)
+// ─────────────────────────────────────────────────────────────
+void loop() {
+  // 1. GPS — pump every tick, no data loss
+  gpsPump();
+
+  // 2. IMU — reads every IMU_READ_EVERY_MS
+  updateImuMotion();
+
+  // 3. Security — runs every loop tick using lastADeltaG/lastGMag
+  updateSecurityAlarm();
+
+  // 4. Buzzer state machine
+  buzzerUpdate();
+
+  // 5. Local portal — handleClient() always gets CPU time here
+  localPortalMaintenance();
+
+  // 6. Drain command queue from netTask (execute polled commands here, Core 1)
+  CmdMsg cmsg;
+  while (xQueueReceive(cmdQueue, &cmsg, 0) == pdTRUE) {
+    executeCommand(String(cmsg.cmd), String(cmsg.cmdId));
+  }
+
+  // 7. LED blink
+  {
+    static uint32_t lastBlink = 0;
+    static bool     ledState  = false;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    bool alarm  = alarmLatched;
+    xSemaphoreGive(stateMutex);
+    const bool noWifi = !wifiIsConnected();
+    const uint32_t blinkMs = alarm ? 140 : (noWifi ? 250 : 900);
+    if (millis() - lastBlink >= blinkMs) {
+      lastBlink = millis();
+      ledState  = !ledState;
+      setLed(ledState);
+    }
+  }
+
+  // 8. Sample + heartbeat timers
+  const uint32_t now = millis();
+  const bool still = isBikeStationary();
+
+  if (now - lastSample >= (still ? SAMPLE_INTERVAL_STILL_MS : SAMPLE_INTERVAL_MOVING_MS)) {
+    lastSample = now;
+    recordSamplePoint();
+  }
+
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeat = now;
+    if (still) recordHeartbeatPoint(F("STILL heartbeat"));
+  }
+
+  // 9. Periodic debug print
+  if (DBG_GPS) {
+    static uint32_t lastDbg = 0;
+    if (now - lastDbg >= 10000) {
+      lastDbg = now;
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      bool sLocked = locked, sArmed = armed, sAlarm = alarmLatched;
+      int  sBuf    = rawCount;
+      xSemaphoreGive(stateMutex);
+
+      Serial.printf(
+        "[DBG] gps=%d age=%lu sats=%d hdop=%.1f spd=%.1f "
+        "imu=%d locked=%d armed=%d alarm=%d buf=%d "
+        "wifi=%d net=%d portal=%d heap=%d\n",
+        (int)gps.location.isValid(),
+        (unsigned long)gps.location.age(),
+        gps.satellites.isValid() ? (int)gps.satellites.value() : -1,
+        gps.hdop.isValid() ? (double)gps.hdop.hdop() : -1.0,
+        gps.speed.isValid() ? (double)gps.speed.kmph() : -1.0,
+        (int)imuMoving,
+        (int)sLocked, (int)sArmed, (int)sAlarm, sBuf,
+        (int)wifiIsConnected(), (int)(bool)gInternetOk, (int)localApActive,
+        (int)esp_get_free_heap_size()
+      );
+    }
+  }
+}
