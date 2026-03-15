@@ -1,0 +1,146 @@
+#include "sensors.h"
+
+namespace {
+
+inline float mag3(float x, float y, float z) {
+  return sqrtf(x * x + y * y + z * z);
+}
+
+}  // namespace
+
+void gpsPump() {
+  int count = 0;
+  while (SerialGPS.available() && count < 64) {
+    gps.encode(static_cast<char>(SerialGPS.read()));
+    count++;
+  }
+}
+
+bool isGoodFix() {
+  if (!gps.location.isValid()) return false;
+  if (gps.location.age() > 5000) return false;
+  if (!gps.satellites.isValid() || gps.satellites.value() < 4) return false;
+  if (gps.hdop.isValid() && gps.hdop.hdop() > 3.0) return false;
+  return true;
+}
+
+bool isInsideBangladesh(double lat, double lon) {
+  return (lat >= 20.0 && lat <= 27.0 && lon >= 88.0 && lon <= 93.0);
+}
+
+void initIMU() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  if (!imu.Begin()) {
+    imuReady = false;
+    return;
+  }
+  imu.ConfigAccelRange(bfs::Mpu6500::ACCEL_RANGE_4G);
+  imu.ConfigGyroRange(bfs::Mpu6500::GYRO_RANGE_500DPS);
+  imu.ConfigDlpfBandwidth(bfs::Mpu6500::DLPF_BANDWIDTH_20HZ);
+  imuReady = true;
+
+  float sx = 0.0f;
+  float sy = 0.0f;
+  float sz = 0.0f;
+  uint16_t ok = 0;
+  for (int i = 0; i < 40; i++) {
+    imu.Read();
+    delay(5);
+  }
+  for (uint16_t i = 0; i < CAL_SAMPLES; i++) {
+    if (imu.Read()) {
+      sx += imu.gyro_x_radps();
+      sy += imu.gyro_y_radps();
+      sz += imu.gyro_z_radps();
+      ok++;
+    }
+    delay(CAL_DELAY_MS);
+  }
+  if (!ok) {
+    imuBias = {};
+    imuReady = false;
+    return;
+  }
+  imuBias.x = sx / ok;
+  imuBias.y = sy / ok;
+  imuBias.z = sz / ok;
+}
+
+void updateImuMotion() {
+  if (!imuReady) return;
+  const uint32_t now = millis();
+  if (now - lastImuReadAt < IMU_READ_EVERY_MS) return;
+  lastImuReadAt = now;
+  if (!imu.Read()) return;
+
+  const float ax = imu.accel_x_mps2();
+  const float ay = imu.accel_y_mps2();
+  const float az = imu.accel_z_mps2();
+  const float gx = imu.gyro_x_radps() - imuBias.x;
+  const float gy = imu.gyro_y_radps() - imuBias.y;
+  const float gz = imu.gyro_z_radps() - imuBias.z;
+
+  const float aMag = mag3(ax, ay, az);
+  const float gMag = mag3(gx, gy, gz);
+  const float aDeltaG = fabsf(aMag - G_MPS2) / G_MPS2;
+
+  lastADeltaG = aDeltaG;
+  lastGMag = gMag;
+
+  bool newMoving = imuMoving;
+  if (!imuMoving) {
+    if ((gMag > GYRO_MOVING_ON) || (aDeltaG > ACCEL_DELTA_ON)) {
+      newMoving = true;
+      imuMovingHoldUntil = now + MOVING_HOLD_MS;
+    }
+  } else if (now >= imuMovingHoldUntil) {
+    if ((gMag < GYRO_MOVING_OFF) && (aDeltaG < ACCEL_DELTA_OFF)) {
+      newMoving = false;
+    } else {
+      imuMovingHoldUntil = now + 120;
+    }
+  }
+
+  if (newMoving != imuMoving) {
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      imuMoving = newMoving;
+      xSemaphoreGive(stateMutex);
+    }
+  }
+}
+
+float getFilteredSpeedKmph_locked() {
+  if (!gps.speed.isValid() || gps.speed.age() > 3000) {
+    return hasFilteredInit ? filteredSpeed : 0.0f;
+  }
+  const float raw = gps.speed.kmph();
+  if (raw > MAX_SPEED_KMPH) return filteredSpeed;
+
+  if (!hasFilteredInit) {
+    filteredSpeed = raw;
+    hasFilteredInit = true;
+  } else {
+    filteredSpeed = SPEED_ALPHA * raw + (1.0f - SPEED_ALPHA) * filteredSpeed;
+  }
+
+  if (filteredSpeed < MIN_SPEED_KMPH) {
+    if (++lowSpeedCount >= STOP_COUNT_REQ) filteredSpeed = 0.0f;
+  } else {
+    lowSpeedCount = 0;
+  }
+  return filteredSpeed;
+}
+
+bool isBikeStationary_locked() {
+  const float spd = getFilteredSpeedKmph_locked();
+  if (!imuReady) return spd < 1.0f;
+  return (!imuMoving && spd < 3.0f);
+}
+
+bool isBikeStationary() {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) != pdTRUE) return true;
+  const bool still = isBikeStationary_locked();
+  xSemaphoreGive(stateMutex);
+  return still;
+}
