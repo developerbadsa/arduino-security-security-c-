@@ -5,6 +5,8 @@
 #include "../sensors/sensors.h"
 #include "../tracking/tracking.h"
 #include "../core/command_processor.h"
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 namespace {
 
@@ -76,6 +78,10 @@ int findLineToken(const String& response, const char* token, int startAt = 0) {
   return -1;
 }
 
+inline void feedNetWatchdog() {
+  esp_task_wdt_reset();
+}
+
 bool responseHasError(const String& response) {
   return response.startsWith("ERROR") ||
          response.indexOf("\r\nERROR") != -1 ||
@@ -137,6 +143,7 @@ bool sendATCommand(const char* cmd,
       return false;
     }
 
+    feedNetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 
@@ -190,6 +197,7 @@ bool sendATReadComplete(const char* cmd, String& response, uint32_t timeout) {
       return false;
     }
 
+    feedNetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 
@@ -216,6 +224,7 @@ bool readAfterRawWrite(String& response, uint32_t timeout, const char* okToken) 
       return false;
     }
 
+    feedNetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 
@@ -240,6 +249,7 @@ bool waitForIncomingLine(String& response, uint32_t timeout, const char* lineTok
       return false;
     }
 
+    feedNetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 
@@ -394,6 +404,7 @@ bool waitForPacketNetwork(uint32_t timeoutMs) {
     }
 
     LOG_PRINTLN_IF(DBG_NET, "GSM", F("Still searching network / GPRS..."));
+    feedNetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(GSM_NETWORK_RETRY_STEP_MS));
   }
 
@@ -672,8 +683,9 @@ void sendSmsReply(const char* sender, const char* text) {
   if (sendATCommand(sendCmd, resp, 5000, ">")) {
     SerialAT.print(text);
     SerialAT.write(0x1A); // CTRL+Z
+    SerialAT.flush();
     if (!readAfterRawWrite(resp, 10000, "OK")) {
-      LOG_PRINTLN_IF(DBG_NET, "SMS", F("Reply send failed"));
+      LOG_PRINTLN_IF(DBG_NET, "SMS", F("Reply send failed or timeout"));
     }
   }
 }
@@ -706,25 +718,24 @@ bool parseSmsHeader(const String& header, int* outIndex, String* outSender) {
   if (outIndex) *outIndex = -1;
   if (outSender) *outSender = "";
 
+  // Format: +CMGL: <index>,"<stat>","<sender>",...
   const int colon = header.indexOf(':');
   if (colon < 0) return false;
   const int comma = header.indexOf(',', colon + 1);
   if (comma < 0) return false;
 
-  String indexText = header.substring(colon + 1, comma);
-  indexText.trim();
-  const int index = indexText.toInt();
-  if (index < 0) return false;
+  String idxStr = header.substring(colon + 1, comma);
+  idxStr.trim();
+  if (outIndex) *outIndex = idxStr.toInt();
 
-  if (outIndex) *outIndex = index;
-
-  const int q1 = header.indexOf('"', comma + 1);
+  // Find sender: skip first pair of quotes (stat)
+  int q1 = header.indexOf('"', comma);
   if (q1 < 0) return true;
-  const int q2 = header.indexOf('"', q1 + 1);
+  int q2 = header.indexOf('"', q1 + 1);
   if (q2 < 0) return true;
-  const int q3 = header.indexOf('"', q2 + 1);
+  int q3 = header.indexOf('"', q2 + 1);
   if (q3 < 0) return true;
-  const int q4 = header.indexOf('"', q3 + 1);
+  int q4 = header.indexOf('"', q3 + 1);
   if (q4 < 0) return true;
 
   if (outSender) *outSender = header.substring(q3 + 1, q4);
@@ -795,51 +806,113 @@ String normalizeSmsBody(const String& body) {
   return normalized;
 }
 
-void processSmsMessage(int index, const String& sender, const String& rawBody) {
-  const String body = normalizeSmsBody(rawBody);
+bool extractAuthorizedSmsCommand(const String& normalizedBody, String* commandOut) {
+  bool hasDeviceId = false;
+  bool hasLocalPin = false;
+  String stripped;
 
-  if (body.indexOf(DEVICE_ID) == -1 || body.indexOf(LOCAL_PIN) == -1) {
-    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unauthorized SMS (Bad ID or PIN)"));
+  int start = 0;
+  while (start < normalizedBody.length()) {
+    while (start < normalizedBody.length() && normalizedBody[start] == ' ') {
+      start++;
+    }
+    if (start >= normalizedBody.length()) break;
+
+    int end = start;
+    while (end < normalizedBody.length() && normalizedBody[end] != ' ') {
+      end++;
+    }
+
+    const String token = normalizedBody.substring(start, end);
+    // Compare exact tokens so "XBIKE01Y" or "122344" cannot bypass auth.
+    if (token == DEVICE_ID) {
+      hasDeviceId = true;
+    } else if (token == LOCAL_PIN) {
+      hasLocalPin = true;
+    } else {
+      if (stripped.length()) stripped += ' ';
+      stripped += token;
+    }
+
+    start = end + 1;
+  }
+
+  if (commandOut) {
+    *commandOut = stripped;
+  }
+  return hasDeviceId && hasLocalPin;
+}
+
+bool parsePollResponseBody(const String& body, String* commandOut, String* commandIdOut) {
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    LOG_PRINTF_IF(DBG_NET, "POLL", "JSON parse failed: %s", err.c_str());
+    if (commandOut) *commandOut = "";
+    if (commandIdOut) *commandIdOut = "";
+    return false;
+  }
+
+  const JsonVariantConst commandVar = doc["command"];
+  const JsonVariantConst commandIdVar = doc["commandId"];
+
+  if (commandOut) {
+    *commandOut = commandVar.is<const char*>() ? String(commandVar.as<const char*>()) : "";
+  }
+  if (commandIdOut) {
+    *commandIdOut = commandIdVar.is<const char*>() ? String(commandIdVar.as<const char*>()) : "";
+  }
+  return true;
+}
+
+void processSmsMessage(int index, const String& sender, const String& rawBody) {
+  const String normalizedBody = normalizeSmsBody(rawBody);
+  String body;
+
+  if (!extractAuthorizedSmsCommand(normalizedBody, &body)) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unauthorized: ID/PIN mismatch"));
     deleteSmsFromStorage(index);
     return;
   }
 
-  if (body.indexOf("AP ON") != -1) {
+  LOG_PRINTF_IF(DBG_NET, "SMS", "Authorized command=%s", clipForLog(body, 48).c_str());
+
+  bool handled = false;
+  if (body.indexOf(F("AP ON")) != -1) {
     localApManualTrigger = true;
     localApManualTriggerAt = millis();
-    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Manual ON via SMS"));
-    if (sender.length() > 0) sendSmsReply(sender.c_str(), "Local AP: ON (30min timeout)");
-    deleteSmsFromStorage(index);
-    return;
-  }
-
-  if (body.indexOf("AP OFF") != -1) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP ON"));
+    sendSmsReply(sender.c_str(), "Local Hotspot: Enabled (30m)");
+    handled = true;
+  } else if (body.indexOf(F("AP OFF")) != -1) {
     localApManualTrigger = false;
-    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Manual OFF via SMS"));
-    if (sender.length() > 0) sendSmsReply(sender.c_str(), "Local AP: OFF");
-    deleteSmsFromStorage(index);
-    return;
-  }
-
-  if (body.indexOf("UNLOCK") != -1) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP OFF"));
+    sendSmsReply(sender.c_str(), "Local Hotspot: Disabled");
+    handled = true;
+  } else if (body.indexOf(F("AP PERSISTENT")) != -1) {
+    portalMode = PM_PERSISTENT;
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Mode: PERSISTENT"));
+    sendSmsReply(sender.c_str(), "AP Mode: Persistent (Always ON)");
+    handled = true;
+  } else if (body.indexOf(F("AP EMERGENCY")) != -1) {
+    portalMode = PM_EMERGENCY;
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Mode: EMERGENCY"));
+    sendSmsReply(sender.c_str(), "AP Mode: Emergency (Alarm/Net Fail only)");
+    handled = true;
+  } else if (body.indexOf(F("AP MANUAL")) != -1) {
+    portalMode = PM_MANUAL;
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Mode: MANUAL"));
+    sendSmsReply(sender.c_str(), "AP Mode: Manual (SMS-trigger only)");
+    handled = true;
+  } else if (body.indexOf(F("UNLOCK")) != -1) {
     const bool queued = queueSmsCommand("UNLOCK");
-    LOG_PRINTLN_IF(DBG_NET, "SMS", queued ? F("UNLOCK via SMS") : F("UNLOCK via SMS failed"));
-    if (sender.length() > 0) sendSmsReply(sender.c_str(), queued ? "Bike: UNLOCK queued" : "Bike: BUSY");
-    deleteSmsFromStorage(index);
-    return;
-  }
-
-  if (body.indexOf("LOCK") != -1) {
+    sendSmsReply(sender.c_str(), queued ? "Bike: Unlocking..." : "Bike: BUSY");
+    handled = true;
+  } else if (body.indexOf(F("LOCK")) != -1) {
     const bool queued = queueSmsCommand("LOCK");
-    LOG_PRINTLN_IF(DBG_NET, "SMS", queued ? F("LOCK via SMS") : F("LOCK via SMS failed"));
-    if (sender.length() > 0) sendSmsReply(sender.c_str(), queued ? "Bike: LOCK queued" : "Bike: BUSY");
-    deleteSmsFromStorage(index);
-    return;
-  }
-
-  if ((body.indexOf("STATUS") != -1 || body.indexOf("LOC") != -1) && sender.length() > 0) {
-    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Status/Loc requested via SMS"));
-
+    sendSmsReply(sender.c_str(), queued ? "Bike: Locking..." : "Bike: BUSY");
+    handled = true;
+  } else if (body.indexOf(F("STATUS")) != -1 || body.indexOf(F("LOC")) != -1) {
     DeviceStateId st = ST_UNLOCKED;
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
       st = getCurrentState_locked();
@@ -848,25 +921,30 @@ void processSmsMessage(int index, const String& sender, const String& rawBody) {
 
     char reply[160];
     int rlen = snprintf(reply, sizeof(reply), "SmartBike %s: %s. ", DEVICE_ID, stateToString(st));
-    if (gps.location.isValid()) {
-      snprintf(reply + rlen, sizeof(reply) - rlen, "Loc: https://www.google.com/maps?q=%.6f,%.6f (Age: %lu)",
-               gps.location.lat(), gps.location.lng(), static_cast<unsigned long>(gps.location.age() / 1000));
+    
+    if (gps.location.isValid() && gps.location.age() < 60000) {
+      snprintf(reply + rlen, sizeof(reply) - rlen, "Live: https://www.google.com/maps?q=%.6f,%.6f",
+               gps.location.lat(), gps.location.lng());
     } else if (gps.location.age() < 3600000UL) {
-      snprintf(reply + rlen, sizeof(reply) - rlen, "Last Loc: https://www.google.com/maps?q=%.6f,%.6f (Age: %lu min)",
-               gps.location.lat(), gps.location.lng(), static_cast<unsigned long>(gps.location.age() / 60000));
+      snprintf(reply + rlen, sizeof(reply) - rlen, "LastLoc (%lu min ago): https://www.google.com/maps?q=%.6f,%.6f",
+               static_cast<unsigned long>(gps.location.age() / 60000), gps.location.lat(), gps.location.lng());
     } else {
-      snprintf(reply + rlen, sizeof(reply) - rlen, "GPS: No Fix");
+      snprintf(reply + rlen, sizeof(reply) - rlen, "GPS: No Signal");
     }
 
+    esp_task_wdt_reset();
     sendSmsReply(sender.c_str(), reply);
-    deleteSmsFromStorage(index);
-    return;
+    esp_task_wdt_reset();
+    handled = true;
   }
 
-  LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unknown SMS command"));
-  if (sender.length() > 0) {
-    sendSmsReply(sender.c_str(), "Format: <DEVICE_ID> <PIN> LOCK | UNLOCK | STATUS | LOC | AP ON | AP OFF");
+  if (!handled) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unknown Command"));
+    esp_task_wdt_reset();
+    sendSmsReply(sender.c_str(), "Err: Use LOCK, UNLOCK, LOC, AP ON, or AP OFF");
+    esp_task_wdt_reset();
   }
+
   deleteSmsFromStorage(index);
 }
 
@@ -1004,7 +1082,9 @@ bool httpPostJSON(const char* url, const String& json, String* outBody) {
   }
 
   response = "";
+  esp_task_wdt_reset();
   if (!waitForHttpActionResult(response, GSM_HTTP_ACTION_TIMEOUT_MS)) {
+    esp_task_wdt_reset();
     recoverHttpStack(F("HTTPACTION timeout, rebuilding bearer"));
     return false;
   }
@@ -1050,24 +1130,6 @@ bool httpPostJSON(const char* url, const String& json, String* outBody) {
   return false;
 }
 
-String jsonFindString(const String& body, const char* key) {
-  const String k = String('"') + key + '"';
-  const int p = body.indexOf(k);
-  if (p < 0) return "";
-
-  const int colon = body.indexOf(':', p);
-  if (colon < 0) return "";
-
-  const int nullPos = body.indexOf("null", colon);
-  if (nullPos >= 0 && (nullPos - colon) < 12) return "null";
-
-  const int q1 = body.indexOf('"', colon);
-  if (q1 < 0) return "";
-  const int q2 = body.indexOf('"', q1 + 1);
-  if (q2 < 0) return "";
-  return body.substring(q1 + 1, q2);
-}
-
 void pumpPendingReport() {
   ReportMsg rmsg = {};
   while (xQueueReceive(reportQueue, &rmsg, 0) == pdTRUE) {
@@ -1091,14 +1153,17 @@ void pumpPendingReport() {
   if (now - lastReportTry < REPORT_RETRY_MS) return;
   lastReportTry = now;
 
-  char json[200];
-  int len = snprintf(json, sizeof(json), "{\"deviceId\":\"%s\",", DEVICE_ID);
+  JsonDocument doc;
+  doc["deviceId"] = DEVICE_ID;
   if (pendingReportCmdId[0] && strcmp(pendingReportCmdId, "null") != 0) {
-    len += snprintf(json + len, sizeof(json) - len, "\"commandId\":\"%s\",", pendingReportCmdId);
+    doc["commandId"] = pendingReportCmdId;
   }
-  snprintf(json + len, sizeof(json) - len, "\"event\":\"%s\"}", pendingReportEvent);
+  doc["event"] = pendingReportEvent;
 
-  if (httpPostJSON(SERVER_URL_REPORT, String(json), nullptr)) {
+  String json;
+  serializeJson(doc, json);
+
+  if (httpPostJSON(SERVER_URL_REPORT, json, nullptr)) {
     LOG_PRINTF_IF(DBG_NET, "REPORT", "sent event=%s", pendingReportEvent);
     pendingReport = false;
     pendingReportEvent[0] = 0;
@@ -1135,22 +1200,26 @@ void pushTrackBatch() {
   const int n = buildCompressedTrack(track, MAX_TRACK_POINTS, localBuf, localCount);
   if (n <= 0) return;
 
-  char json[850];
-  int len = snprintf(json, sizeof(json),
-                     "{\"deviceId\":\"%s\",\"state\":\"%s\",\"track\":[",
-                     DEVICE_ID, stateToString(topSt));
-
+  JsonDocument doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["state"] = stateToString(topSt);
+  JsonArray trackArray = doc["track"].to<JsonArray>();
   for (int i = 0; i < n; i++) {
-    const char* pfx = (i == 0) ? "" : ",";
-    len += snprintf(json + len, sizeof(json) - len,
-                    "%s{\"lat\":%.6f,\"lon\":%.6f,\"speed\":%.2f,\"state\":\"%s\"}",
-                    pfx, track[i].lat, track[i].lon, track[i].speed,
-                    stateToString(static_cast<DeviceStateId>(track[i].st)));
+    JsonObject point = trackArray.add<JsonObject>();
+    point["lat"] = track[i].lat;
+    point["lon"] = track[i].lon;
+    point["speed"] = track[i].speed;
+    point["state"] = stateToString(static_cast<DeviceStateId>(track[i].st));
+    if (track[i].utcEpoch != 0) {
+      point["ts"] = track[i].utcEpoch;
+    }
   }
-  snprintf(json + len, sizeof(json) - len, "]}");
+
+  String json;
+  serializeJson(doc, json);
 
   LOG_PRINTF_IF(DBG_NET, "PUSH", "send raw=%d packed=%d", localCount, n);
-  const bool ok = httpPostJSON(SERVER_URL_PUSH, String(json), nullptr);
+  const bool ok = httpPostJSON(SERVER_URL_PUSH, json, nullptr);
 
   if (ok) {
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1170,16 +1239,22 @@ void pushTrackBatch() {
 void pollCommand() {
   if (!netIsConnected()) return;
 
-  char json[64];
-  snprintf(json, sizeof(json), "{\"deviceId\":\"%s\"}", DEVICE_ID);
+  JsonDocument requestDoc;
+  requestDoc["deviceId"] = DEVICE_ID;
+  String json;
+  serializeJson(requestDoc, json);
 
   String body;
-  if (!httpPostJSON(SERVER_URL_POLL, String(json), &body)) return;
+  if (!httpPostJSON(SERVER_URL_POLL, json, &body)) return;
 
-  const String command = jsonFindString(body, "command");
-  const String commandId = jsonFindString(body, "commandId");
-  if (!command.length() || command == "null") {
-    LOG_PRINTLN_IF(DBG_NET, "POLL", F("No command"));
+  String command;
+  String commandId;
+  if (!parsePollResponseBody(body, &command, &commandId) || !command.length()) {
+    static uint32_t lastNoCmdLog = 0;
+    if (millis() - lastNoCmdLog >= 60000UL) {
+      LOG_PRINTLN_IF(DBG_NET, "POLL", F("No command (suppressed)"));
+      lastNoCmdLog = millis();
+    }
     return;
   }
 
@@ -1221,6 +1296,9 @@ uint32_t adaptivePollInterval(uint32_t baseMs) {
 void netTask(void* pv) {
   (void)pv;
   vTaskDelay(pdMS_TO_TICKS(3000));
+  
+  // Register netTask for watchdog monitoring
+  esp_task_wdt_add(nullptr);
 
   uint32_t lastPushLocal = 0;
   uint32_t lastPollLocal = 0;
@@ -1230,6 +1308,7 @@ void netTask(void* pv) {
     handleIncomingSms();
     internetProbe();
     pumpPendingReport();
+    esp_task_wdt_reset(); // Feed watchdog from netTask
 
     const bool still = isBikeStationary();
     const bool noNet = !netIsConnected() || !gInternetOk;

@@ -4,6 +4,20 @@
 #include "../logging/logger.h"
 #include "../sensors/sensors.h"
 
+void queueReportFromLoop(const char* event, const char* cmdId);
+
+namespace {
+
+bool takeStateMutexOrReport(const char* cmdId) {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) return true;
+
+  logPrintln("CMD", F("WARN stateMutex timeout"));
+  queueReportFromLoop("MUTEX_TIMEOUT", cmdId ? cmdId : "");
+  return false;
+}
+
+}  // namespace
+
 void queueReportFromLoop(const char* event, const char* cmdId) {
   if (!reportQueue) return;
 
@@ -38,6 +52,12 @@ void executeCommand(const char* cmd, const char* cmdId) {
     buzzerStartLockPattern();
     relayOn();
     setLed(false);
+
+    if (!takeStateMutexOrReport(cmdId)) return;
+    locked = true;
+    xSemaphoreGive(stateMutex);
+
+    logPrintln("CMD", F("LOCK applied"));
     queueReportFromLoop("LOCK_DONE", cmdId ? cmdId : "");
     return;
   }
@@ -45,61 +65,66 @@ void executeCommand(const char* cmd, const char* cmdId) {
   if (strcmp(cmd, "UNLOCK") == 0) {
     relayOff();
     setLed(true);
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+    if (!takeStateMutexOrReport(cmdId)) return;
+    locked = false;
     armed = false;
     alarmLatched = false;
     armSettleUntil = 0;
-    xSemaphoreGive(stateMutex);
     knockCount = 0;
     firstKnockAt = 0;
     lastKnockAt = 0;
     tamperMotionSince = 0;
     touchSince = 0;
     lastTouchFireAt = 0;
+    xSemaphoreGive(stateMutex);
     buzzerStartUnlockPattern();
+    logPrintln("CMD", F("UNLOCK applied"));
     queueReportFromLoop("UNLOCK_DONE", cmdId ? cmdId : "");
     return;
   }
 
   if (strcmp(cmd, "ARM") == 0) {
-    xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10));
+    if (!takeStateMutexOrReport(cmdId)) return;
     const bool isLocked = locked;
     xSemaphoreGive(stateMutex);
     if (!isLocked) {
+      logPrintln("CMD", F("ARM rejected: unlocked"));
       queueReportFromLoop("ARM_REJECT_UNLOCKED", cmdId ? cmdId : "");
       return;
     }
 
     if (!isBikeStationary()) {
-      LOG_PRINTLN_IF(DBG_SEC, "CMD", F("ARM rejected: bike not stationary"));
+      logPrintln("CMD", F("ARM rejected: bike not stationary"));
       queueReportFromLoop("ARM_REJECT_MOVING", cmdId ? cmdId : "");
       return;
     }
 
     if (!imuReady) {
-      LOG_PRINTLN_IF(DBG_SEC, "CMD", F("ARM rejected: IMU not ready"));
+      logPrintln("CMD", F("ARM rejected: IMU not ready"));
       queueReportFromLoop("ARM_REJECT_IMU", cmdId ? cmdId : "");
       return;
     }
 
     if (!recalibrateImuBias()) {
-      LOG_PRINTLN_IF(DBG_SEC, "CMD", F("ARM rejected: IMU recalibration failed"));
+      logPrintln("CMD", F("ARM rejected: IMU recalibration failed"));
       queueReportFromLoop("ARM_REJECT_IMU", cmdId ? cmdId : "");
       return;
     }
 
-    xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10));
+    if (!takeStateMutexOrReport(cmdId)) return;
     armed = true;
     alarmLatched = false;
     armSettleUntil = millis() + ARM_SETTLE_MS;
-    xSemaphoreGive(stateMutex);
     knockCount = 0;
     firstKnockAt = 0;
     lastKnockAt = 0;
     tamperMotionSince = 0;
     touchSince = 0;
     lastTouchFireAt = 0;
+    xSemaphoreGive(stateMutex);
     buzzerStartArmPattern();
+    logPrintln("CMD", F("ARM enabled"));
     queueReportFromLoop("ARM_ON", cmdId ? cmdId : "");
     return;
   }

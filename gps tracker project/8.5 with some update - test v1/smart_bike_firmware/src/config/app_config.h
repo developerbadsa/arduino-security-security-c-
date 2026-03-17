@@ -29,14 +29,15 @@ static constexpr uint32_t GSM_HTTP_DATA_TIMEOUT_MS = 10000UL;
 static constexpr int GSM_MIN_CSQ = 8;
 static constexpr size_t HTTP_LOG_BODY_LIMIT = 180;
 
+// Set all DBG_* to false before deploying to production device.
 // Debug flags
-static constexpr bool DBG_NET = true;
+static constexpr bool DBG_NET = false;
 static constexpr bool DBG_NET_AT = false;
 static constexpr bool DBG_HTTP_BODY = false;
 static constexpr bool DBG_GPS = false;
 static constexpr bool DBG_IMU = false;
-static constexpr bool DBG_SEC = true;
-static constexpr bool DBG_LOCAL = true;
+static constexpr bool DBG_SEC = false;
+static constexpr bool DBG_LOCAL = false;
 
 // Hardware pins
 static constexpr int GPS_RX = 16;
@@ -62,7 +63,6 @@ static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5UL * 60UL * 1000UL;
 static constexpr uint32_t NET_CHECK_EVERY_MS = 8000UL;
 static constexpr uint32_t NET_OK_TTL_MS = 15000UL;
 static constexpr uint32_t REPORT_RETRY_MS = 5000UL;
-static constexpr uint32_t HTTP_TIMEOUT_MS = 3000UL;
 
 // Buzzer
 static constexpr uint32_t ALARM_BUZZ_MS = 12000UL;

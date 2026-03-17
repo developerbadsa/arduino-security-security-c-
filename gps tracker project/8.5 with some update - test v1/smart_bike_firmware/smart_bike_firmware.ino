@@ -1,4 +1,48 @@
+// Smart Bike Firmware - 9
 #include "src/smart_bike_app.h"
+#include <esp_err.h>
+#include <esp_task_wdt.h>
+
+#if __has_include(<esp_idf_version.h>)
+#include <esp_idf_version.h>
+#endif
+
+namespace {
+
+constexpr uint32_t WDT_TIMEOUT_SEC = 30;
+constexpr uint32_t WDT_TIMEOUT_MS = WDT_TIMEOUT_SEC * 1000U;
+
+bool configureTaskWatchdog() {
+#if defined(ESP_IDF_VERSION) && (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+  const esp_task_wdt_config_t wdtConfig = {WDT_TIMEOUT_MS, 0, true};
+
+  esp_err_t err = esp_task_wdt_init(&wdtConfig);
+  if (err == ESP_ERR_INVALID_STATE) {
+    err = esp_task_wdt_reconfigure(&wdtConfig);
+  }
+#else
+  esp_err_t err = esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+#endif
+
+  if (err != ESP_OK) {
+    logPrintf("SYS", "Task watchdog init failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  err = esp_task_wdt_status(nullptr);
+  if (err == ESP_ERR_NOT_FOUND) {
+    err = esp_task_wdt_add(nullptr);
+  }
+
+  if (err != ESP_OK) {
+    logPrintf("SYS", "Task watchdog subscribe failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
 
 void setup() {
   Serial.begin(SERIAL_LOG_BAUD);
@@ -49,6 +93,10 @@ void setup() {
   lastHeartbeat = now;
 
   logPrintln("SYS", F("Setup done - full features active"));
+
+  if (configureTaskWatchdog()) {
+    logPrintf("SYS", "Task watchdog enabled (%lu ms)", static_cast<unsigned long>(WDT_TIMEOUT_MS));
+  }
 }
 
 void loop() {
@@ -57,6 +105,7 @@ void loop() {
   updateSecurityAlarm();
   buzzerUpdate();
   localPortalMaintenance();
+  esp_task_wdt_reset(); // Feed watchdog from main loop
 
   CmdMsg cmsg = {};
   while (xQueueReceive(cmdQueue, &cmsg, 0) == pdTRUE) {

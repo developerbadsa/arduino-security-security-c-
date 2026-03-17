@@ -1,8 +1,43 @@
 #include "sensors.h"
 
 #include "../logging/logger.h"
+#include <esp_task_wdt.h>
 
 namespace {
+uint32_t imuReadFailCount = 0;
+static constexpr uint32_t IMU_RECOVERY_THRESHOLD = 10;
+bool lastGpsFixState = false;
+bool gpsFixStateKnown = false;
+
+void recoverI2CBus_internal(int sda, int scl) {
+  logPrintln("I2C", F("Stuck bus detected. Attempting bit-bang recovery..."));
+  
+  // 1. Force pins to GPIO mode
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, OUTPUT);
+  digitalWrite(scl, HIGH);
+  delayMicroseconds(5);
+  
+  // 2. Pulse SCL up to 9 times to free SDA
+  for (int i = 0; i < 9; i++) {
+    if (digitalRead(sda) == HIGH) break; // SDA released!
+    digitalWrite(scl, LOW);
+    delayMicroseconds(5);
+    digitalWrite(scl, HIGH);
+    delayMicroseconds(5);
+  }
+  
+  // 3. Generate a STOP condition
+  pinMode(sda, OUTPUT);
+  digitalWrite(sda, LOW);
+  delayMicroseconds(5);
+  digitalWrite(scl, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(sda, HIGH);
+  delayMicroseconds(5);
+  
+  logPrintln("I2C", F("Recovery complete."));
+}
 
 inline float mag3(float x, float y, float z) {
   return sqrtf(x * x + y * y + z * z);
@@ -69,6 +104,36 @@ void gpsPump() {
     gps.encode(static_cast<char>(SerialGPS.read()));
     count++;
   }
+
+  const bool goodFix = isGoodFix();
+  if (!gpsFixStateKnown) {
+    lastGpsFixState = goodFix;
+    gpsFixStateKnown = true;
+    if (goodFix) {
+      logPrintf("GPS",
+                "fix ready sats=%d hdop=%.1f",
+                gps.satellites.isValid() ? static_cast<int>(gps.satellites.value()) : -1,
+                gps.hdop.isValid() ? static_cast<double>(gps.hdop.hdop()) : -1.0);
+    }
+    return;
+  }
+
+  if (goodFix == lastGpsFixState) return;
+  lastGpsFixState = goodFix;
+
+  if (goodFix) {
+    logPrintf("GPS",
+              "fix ready sats=%d hdop=%.1f",
+              gps.satellites.isValid() ? static_cast<int>(gps.satellites.value()) : -1,
+              gps.hdop.isValid() ? static_cast<double>(gps.hdop.hdop()) : -1.0);
+    return;
+  }
+
+  logPrintf("GPS",
+            "fix lost age=%lu sats=%d hdop=%.1f",
+            static_cast<unsigned long>(gps.location.age()),
+            gps.satellites.isValid() ? static_cast<int>(gps.satellites.value()) : -1,
+            gps.hdop.isValid() ? static_cast<double>(gps.hdop.hdop()) : -1.0);
 }
 
 bool isGoodFix() {
@@ -167,7 +232,16 @@ void updateImuMotion() {
   const uint32_t now = millis();
   if (now - lastImuReadAt < IMU_READ_EVERY_MS) return;
   lastImuReadAt = now;
-  if (!imu.Read()) return;
+  if (!imu.Read()) {
+    imuReadFailCount++;
+    if (imuReadFailCount >= IMU_RECOVERY_THRESHOLD) {
+      imuReadFailCount = 0;
+      recoverI2CBus_internal(I2C_SDA, I2C_SCL);
+      initIMU();
+    }
+    return;
+  }
+  imuReadFailCount = 0;
 
   const float ax = imu.accel_x_mps2();
   const float ay = imu.accel_y_mps2();

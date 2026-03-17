@@ -9,11 +9,18 @@ enum DeviceStateId : uint8_t {
   ST_ALARM = 3
 };
 
+enum PortalMode : uint8_t {
+  PM_EMERGENCY = 0, // Alarm or No Net
+  PM_PERSISTENT = 1, // Always ON
+  PM_MANUAL = 2     // SMS only (30min)
+};
+
 struct TrackPoint {
   double lat;
   double lon;
   float speed;
   uint32_t tMs;
+  uint32_t utcEpoch;   // Unix timestamp, 0 if GPS time unavailable
   uint8_t st;
 };
 

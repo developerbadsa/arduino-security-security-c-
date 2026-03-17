@@ -96,3 +96,5 @@ extern uint32_t localPinLockedUntil;
 
 extern volatile bool localApManualTrigger;
 extern uint32_t localApManualTriggerAt;
+
+extern volatile PortalMode portalMode;

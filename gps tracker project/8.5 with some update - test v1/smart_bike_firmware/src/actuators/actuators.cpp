@@ -48,18 +48,10 @@ void buzzerStartPattern(const BeepStep* pat, uint8_t len) {
 
 void relayOn() {
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
-  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    locked = true;
-    xSemaphoreGive(stateMutex);
-  }
 }
 
 void relayOff() {
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
-  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    locked = false;
-    xSemaphoreGive(stateMutex);
-  }
 }
 
 void setLed(bool on) {

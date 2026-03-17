@@ -65,3 +65,4 @@ uint32_t localPinLockedUntil = 0;
 
 volatile bool localApManualTrigger = false;
 uint32_t localApManualTriggerAt = 0;
+volatile PortalMode portalMode = PM_EMERGENCY;

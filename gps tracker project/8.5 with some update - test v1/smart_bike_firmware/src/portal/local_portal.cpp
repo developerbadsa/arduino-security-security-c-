@@ -37,6 +37,9 @@ void appendJsonEscaped(String& out, const char* text) {
 }
 
 bool shouldKeepPortalOn() {
+  if (portalMode == PM_PERSISTENT) return true;
+  if (portalMode == PM_MANUAL) return localApManualTrigger;
+  // PM_EMERGENCY (Default)
   return alarmLatched || !netIsConnected() || !gInternetOk || localApManualTrigger;
 }
 
