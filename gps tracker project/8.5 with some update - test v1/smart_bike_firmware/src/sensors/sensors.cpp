@@ -1,9 +1,33 @@
 #include "sensors.h"
 
+#include "../logging/logger.h"
+
 namespace {
 
 inline float mag3(float x, float y, float z) {
   return sqrtf(x * x + y * y + z * z);
+}
+
+constexpr uint8_t IMU_WHO_AM_I_REG = 0x75;
+
+int readWhoAmI(uint8_t address) {
+  Wire.beginTransmission(address);
+  Wire.write(IMU_WHO_AM_I_REG);
+  if (Wire.endTransmission(false) != 0) return -1;
+
+  const int readCount = Wire.requestFrom(static_cast<int>(address), 1);
+  if (readCount != 1 || !Wire.available()) return -1;
+  return Wire.read();
+}
+
+const __FlashStringHelper* describeWhoAmI(int whoAmI) {
+  switch (whoAmI) {
+    case 0x70: return F("MPU6500");
+    case 0x68: return F("MPU6050");
+    case 0x71: return F("MPU9250");
+    case 0x73: return F("MPU9255");
+    default: return F("UNKNOWN");
+  }
 }
 
 bool captureGyroBias(uint16_t sampleCount, uint16_t sampleDelayMs, GyroBias* outBias) {
@@ -62,22 +86,63 @@ bool isInsideBangladesh(double lat, double lon) {
 void initIMU() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
+
+#if !SMARTBIKE_HAS_MPU6500
+  imuReady = false;
+  logPrintln("IMU", F("driver not installed, IMU disabled"));
+  return;
+#endif
+
+  const int whoPrimary = readWhoAmI(bfs::Mpu6500::I2C_ADDR_PRIM);
+  const int whoSecondary = readWhoAmI(bfs::Mpu6500::I2C_ADDR_SEC);
+
+  if (whoPrimary >= 0) {
+    const String whoPrimaryText = String(describeWhoAmI(whoPrimary));
+    logPrintf("IMU", "scan 0x68=0x%02X %s", whoPrimary, whoPrimaryText.c_str());
+  } else {
+    logPrintln("IMU", F("scan 0x68=NA"));
+  }
+
+  if (whoSecondary >= 0) {
+    const String whoSecondaryText = String(describeWhoAmI(whoSecondary));
+    logPrintf("IMU", "scan 0x69=0x%02X %s", whoSecondary, whoSecondaryText.c_str());
+  } else {
+    logPrintln("IMU", F("scan 0x69=NA"));
+  }
+
+  bfs::Mpu6500::I2cAddr imuAddr = bfs::Mpu6500::I2C_ADDR_PRIM;
+  if (whoPrimary == 0x70) {
+    imuAddr = bfs::Mpu6500::I2C_ADDR_PRIM;
+  } else if (whoSecondary == 0x70) {
+    imuAddr = bfs::Mpu6500::I2C_ADDR_SEC;
+  } else {
+    imuReady = false;
+    logPrintln("IMU", F("no MPU6500 detected on 0x68/0x69"));
+    return;
+  }
+
+  imu.Config(&Wire, imuAddr);
+
   if (!imu.Begin()) {
     imuReady = false;
+    logPrintln("IMU", F("init failed"));
     return;
   }
   imu.ConfigAccelRange(bfs::Mpu6500::ACCEL_RANGE_4G);
   imu.ConfigGyroRange(bfs::Mpu6500::GYRO_RANGE_500DPS);
   imu.ConfigDlpfBandwidth(bfs::Mpu6500::DLPF_BANDWIDTH_20HZ);
+  imu.ConfigSrd(19);
   imuReady = true;
 
   GyroBias newBias = {};
   if (!captureGyroBias(CAL_SAMPLES, CAL_DELAY_MS, &newBias)) {
     imuBias = {};
     imuReady = false;
+    logPrintln("IMU", F("bias calibration failed"));
     return;
   }
   imuBias = newBias;
+  logPrintf("IMU", "ready addr=0x%02X", static_cast<int>(imuAddr));
 }
 
 bool recalibrateImuBias() {

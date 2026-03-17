@@ -20,7 +20,7 @@
 //
 // -------------------- PINOUT (your current firmware wiring) --------------------
 // GPS NEO-6/7M (UART1):   RX=GPIO16, TX=GPIO17, 9600
-// SIM800 (UART2):         RX=GPIO26, TX=GPIO27, 9600 (fallback 115200)
+// SIM800 (UART2):         RX=GPIO26 (holud), TX=GPIO27(black), 9600 (fallback 115200)
 // I2C MPU6500:            SDA=GPIO21, SCL=GPIO22
 // Relay (ignition kill):  GPIO25 (ACTIVE LOW)
 // Buzzer relay:           GPIO32 (ACTIVE LOW)

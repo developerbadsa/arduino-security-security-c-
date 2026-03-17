@@ -2,6 +2,8 @@
 
 #include "../actuators/actuators.h"
 #include "../core/command_processor.h"
+#include "../logging/logger.h"
+#include "../sensors/sensors.h"
 
 namespace {
 
@@ -20,8 +22,9 @@ void triggerAlarm(const __FlashStringHelper* reason) {
 
   buzzerStartAlarm(ALARM_BUZZ_MS);
   if (DBG_SEC) {
-    Serial.print(F("[SEC] ALARM: "));
-    Serial.println(reason);
+    String msg = F("ALARM: ");
+    msg += reason;
+    logPrintln("SEC", msg);
   }
   queueReportFromLoop("ALARM_TRIGGERED", "");
 }
@@ -29,27 +32,17 @@ void triggerAlarm(const __FlashStringHelper* reason) {
 }  // namespace
 
 void updateSecurityAlarm() {
-  if (!imuReady) return;
-
   bool isArmed = false;
   bool isLocked = false;
+  float filteredSpd = 0.0f;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     isArmed = armed;
     isLocked = locked;
+    filteredSpd = getFilteredSpeedKmph_locked();
     xSemaphoreGive(stateMutex);
   }
 
   if (!isArmed || !isLocked) return;
-
-  const bool spdValid = gps.speed.isValid() && (gps.speed.age() <= 3000);
-  const float spd = spdValid ? gps.speed.kmph() : 0.0f;
-  if (spdValid && spd >= 2.0f) {
-    knockCount = 0;
-    firstKnockAt = 0;
-    tamperMotionSince = 0;
-    touchSince = 0;
-    return;
-  }
 
   const uint32_t now = millis();
   bool isSettling = false;
@@ -64,6 +57,17 @@ void updateSecurityAlarm() {
     touchSince = 0;
     return;
   }
+
+  if (filteredSpd >= MIN_SPEED_KMPH) {
+    knockCount = 0;
+    firstKnockAt = 0;
+    tamperMotionSince = 0;
+    touchSince = 0;
+    triggerAlarm(F("GPS MOTION"));
+    return;
+  }
+
+  if (!imuReady) return;
 
   const bool touchNow = (lastADeltaG > TOUCH_DELTA_G) || (lastGMag > TOUCH_GYRO);
   if (touchNow) {

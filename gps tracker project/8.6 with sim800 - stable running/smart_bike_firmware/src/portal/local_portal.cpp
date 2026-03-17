@@ -2,9 +2,43 @@
 
 #include "../core/command_processor.h"
 #include "../core/state_logic.h"
+#include "../logging/logger.h"
+#include "../network/network.h"
 #include "portal_html.h"
 
 namespace {
+
+bool localRoutesReady = false;
+
+void appendJsonEscaped(String& out, const char* text) {
+  out += '\"';
+  if (text) {
+    for (size_t i = 0; text[i]; ++i) {
+      const char c = text[i];
+      switch (c) {
+        case '\\': out += F("\\\\"); break;
+        case '\"': out += F("\\\""); break;
+        case '\b': out += F("\\b"); break;
+        case '\f': out += F("\\f"); break;
+        case '\n': out += F("\\n"); break;
+        case '\r': out += F("\\r"); break;
+        case '\t': out += F("\\t"); break;
+        default:
+          if (static_cast<uint8_t>(c) < 0x20) {
+            out += ' ';
+          } else {
+            out += c;
+          }
+          break;
+      }
+    }
+  }
+  out += '\"';
+}
+
+bool shouldKeepPortalOn() {
+  return alarmLatched || !netIsConnected() || !gInternetOk;
+}
 
 bool localCheckPinOk() {
   const uint32_t now = millis();
@@ -37,7 +71,7 @@ void localHandleStatus() {
   bool sLocked = false;
   bool sArmed = false;
   bool sAlarm = false;
-  bool sWifi = false;
+  bool sAp = false;
   bool sNet = false;
   float sDeltaG = 0.0f;
   float sGMag = 0.0f;
@@ -45,21 +79,24 @@ void localHandleStatus() {
   bool sImuReady = false;
   int sBufCount = 0;
   DeviceStateId sSt = ST_UNLOCKED;
+  RecentLogEntry logs[RECENT_LOG_COUNT] = {};
+  const size_t logCount = recentLogSnapshot(logs, RECENT_LOG_COUNT);
 
-  xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100));
-  sLocked = locked;
-  sArmed = armed;
-  sAlarm = alarmLatched;
-  sDeltaG = lastADeltaG;
-  sGMag = lastGMag;
-  sImuMoving = imuMoving;
-  sBufCount = rawCount;
-  sSt = getCurrentState_locked();
-  xSemaphoreGive(stateMutex);
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    sLocked = locked;
+    sArmed = armed;
+    sAlarm = alarmLatched;
+    sDeltaG = lastADeltaG;
+    sGMag = lastGMag;
+    sImuMoving = imuMoving;
+    sBufCount = rawCount;
+    sSt = getCurrentState_locked();
+    xSemaphoreGive(stateMutex);
+  }
 
   sImuReady = imuReady;
-  sWifi = (WiFi.status() == WL_CONNECTED);
-  sNet = static_cast<bool>(gInternetOk);
+  sAp = localApActive;
+  sNet = netIsConnected() && static_cast<bool>(gInternetOk);
 
   char gpsStr[80];
   snprintf(gpsStr, sizeof(gpsStr), "%s age=%lu sats=%d hdop=%.1f",
@@ -80,10 +117,13 @@ void localHandleStatus() {
            static_cast<double>(sGMag));
 
   String out;
-  out.reserve(450);
+  out.reserve(3200);
   out += F("{\"state\":\"");
   out += stateToString(sSt);
   out += F("\",");
+  out += F("\"now\":");
+  out += millis();
+  out += F(",");
   out += F("\"locked\":");
   out += sLocked ? "true" : "false";
   out += F(",");
@@ -93,8 +133,8 @@ void localHandleStatus() {
   out += F("\"alarm\":");
   out += sAlarm ? "true" : "false";
   out += F(",");
-  out += F("\"wifi\":");
-  out += sWifi ? "true" : "false";
+  out += F("\"ap\":");
+  out += sAp ? "true" : "false";
   out += F(",");
   out += F("\"net\":");
   out += sNet ? "true" : "false";
@@ -110,7 +150,17 @@ void localHandleStatus() {
   out += F("\",");
   out += F("\"buf\":\"");
   out += sBufCount;
-  out += F(" raw\"}");
+  out += F(" raw\",");
+  out += F("\"logs\":[");
+  for (size_t i = 0; i < logCount; ++i) {
+    if (i) out += ',';
+    out += F("{\"ms\":");
+    out += logs[i].atMs;
+    out += F(",\"text\":");
+    appendJsonEscaped(out, logs[i].text);
+    out += '}';
+  }
+  out += F("]}");
 
   localServer.send(200, "application/json", out);
 }
@@ -139,6 +189,7 @@ void localHandleNotFound() {
 }
 
 void localPortalSetupRoutes() {
+  if (localRoutesReady) return;
   localServer.on("/", HTTP_ANY, localHandleRoot);
   localServer.on("/status", HTTP_ANY, localHandleStatus);
   localServer.on("/api/lock", HTTP_ANY, [] { localHandleCmd("LOCK"); });
@@ -151,12 +202,21 @@ void localPortalSetupRoutes() {
   localServer.on("/connecttest.txt", HTTP_ANY, localHandleRoot);
   localServer.on("/ncsi.txt", HTTP_ANY, localHandleRoot);
   localServer.onNotFound(localHandleNotFound);
+  localRoutesReady = true;
 }
 
 }  // namespace
 
 void localPortalStart() {
   if (localApActive) return;
+
+  WiFi.mode(WIFI_AP);
+  delay(50);
+
+  char apSsid[40];
+  snprintf(apSsid, sizeof(apSsid), "%s-LOCAL", DEVICE_ID);
+  WiFi.softAP(apSsid, LOCAL_AP_PASS);
+  delay(100);
 
   localApLastActivityAt = millis();
   IPAddress ip = WiFi.softAPIP();
@@ -165,15 +225,14 @@ void localPortalStart() {
   localServer.begin();
   localApActive = true;
 
-  Serial.printf("[LOCAL] active=%d ip=%s stations=%d\n",
-                static_cast<int>(localApActive),
-                WiFi.softAPIP().toString().c_str(),
-                WiFi.softAPgetStationNum());
+  logPrintf("LOCAL",
+            "active=%d ip=%s stations=%d",
+            static_cast<int>(localApActive),
+            WiFi.softAPIP().toString().c_str(),
+            WiFi.softAPgetStationNum());
 
   if (DBG_LOCAL) {
-    char ssid[40];
-    WiFi.softAPSSID().toCharArray(ssid, sizeof(ssid));
-    Serial.printf("[LOCAL] Portal ON  ssid=%s  ip=%s\n", ssid, ip.toString().c_str());
+    logPrintf("LOCAL", "Portal ON ssid=%s ip=%s", apSsid, ip.toString().c_str());
   }
 }
 
@@ -181,13 +240,29 @@ void localPortalStop() {
   if (!localApActive) return;
   localServer.stop();
   localDns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
   localApActive = false;
   localApLastActivityAt = 0;
-  if (DBG_LOCAL) Serial.println(F("[LOCAL] Portal OFF"));
+  if (DBG_LOCAL) logPrintln("LOCAL", F("Portal OFF"));
 }
 
 void localPortalMaintenance() {
-  if (!localApActive) return;
+  if (!localApActive) {
+    if (shouldKeepPortalOn()) {
+      localPortalStart();
+    }
+    return;
+  }
+
   localDns.processNextRequest();
   localServer.handleClient();
+
+  const bool hasStations = WiFi.softAPgetStationNum() > 0;
+  if (!hasStations &&
+      !shouldKeepPortalOn() &&
+      localApLastActivityAt != 0 &&
+      (millis() - localApLastActivityAt >= LOCAL_AP_IDLE_OFF_MS)) {
+    localPortalStop();
+  }
 }

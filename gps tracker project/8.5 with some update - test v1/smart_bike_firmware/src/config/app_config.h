@@ -7,17 +7,33 @@ static constexpr const char* SERVER_URL_PUSH = "http://smartbike.ashikdev.com/ap
 static constexpr const char* SERVER_URL_POLL = "http://smartbike.ashikdev.com/api/device/poll";
 static constexpr const char* SERVER_URL_REPORT = "http://smartbike.ashikdev.com/api/device/report";
 static constexpr const char* DEVICE_ID = "BIKE01";
+static constexpr uint32_t SERIAL_LOG_BAUD = 115200UL;
 
-// Wi-Fi config
-static constexpr const char* WIFI_SSID = "a";
-static constexpr const char* WIFI_PASS = "87654321q";
+// Local AP / portal
 static constexpr const char* LOCAL_AP_PASS = "bikelocal88";
 static constexpr const char* LOCAL_PIN = "2234";
 
+// GSM config
+static constexpr const char* GSM_APN = "blweb";
+static constexpr const char* GSM_USER = "";
+static constexpr const char* GSM_PASS = "";
+static constexpr int GSM_RX = 27;
+static constexpr int GSM_TX = 26;
+static constexpr uint32_t GSM_BAUD = 9600UL;
+static constexpr uint32_t GSM_BOOT_DELAY_MS = 10000UL;
+static constexpr uint32_t GSM_NETWORK_WAIT_MS = 180000UL;
+static constexpr uint32_t GSM_NETWORK_RETRY_STEP_MS = 5000UL;
+static constexpr uint32_t GSM_AT_TIMEOUT_MS = 2500UL;
+static constexpr uint32_t GSM_HTTP_ACTION_TIMEOUT_MS = 30000UL;
+static constexpr uint32_t GSM_HTTP_DATA_TIMEOUT_MS = 10000UL;
+static constexpr int GSM_MIN_CSQ = 8;
+static constexpr size_t HTTP_LOG_BODY_LIMIT = 180;
+
 // Debug flags
 static constexpr bool DBG_NET = true;
-static constexpr bool DBG_HTTP_BODY = true;
-static constexpr bool DBG_GPS = true;
+static constexpr bool DBG_NET_AT = false;
+static constexpr bool DBG_HTTP_BODY = false;
+static constexpr bool DBG_GPS = false;
 static constexpr bool DBG_IMU = false;
 static constexpr bool DBG_SEC = true;
 static constexpr bool DBG_LOCAL = true;
@@ -90,10 +106,11 @@ static constexpr int MAX_TRACK_POINTS = 5;
 static constexpr float MIN_SAMPLE_DIST_M = 12.0f;
 static constexpr double MAX_JUMP_DIST_M = 50000.0;
 
+// Network backoff
+static constexpr uint32_t GSM_CONNECT_TIMEOUT_MS = 30000UL;
+static constexpr uint32_t NET_BACKOFF_MAX_MS = 5UL * 60UL * 1000UL;
+
 // Local portal PIN
 static constexpr uint8_t LOCAL_PIN_FAIL_MAX = 5;
 static constexpr uint32_t LOCAL_PIN_LOCK_MS = 30000UL;
-
-// Wi-Fi backoff
-static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
-static constexpr uint32_t NET_BACKOFF_MAX_MS = 5UL * 60UL * 1000UL;
+static constexpr uint32_t LOCAL_AP_IDLE_OFF_MS = 5UL * 60UL * 1000UL;

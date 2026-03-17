@@ -1,26 +1,35 @@
 #pragma once
 
+#if !defined(ARDUINO_ARCH_ESP32)
+#error "SmartBike firmware requires an ESP32 board package. In Arduino IDE install/select an Espressif ESP32 board such as ESP32 Dev Module."
+#endif
+
 #include <Arduino.h>
 #include <DNSServer.h>
-#include <HTTPClient.h>
 #include <HardwareSerial.h>
-#include <TinyGPSPlus.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
 #include <Wire.h>
-#include <cstring>
+#include <string.h>
 #include <math.h>
 
 #include "../config/app_config.h"
 #include "app_types.h"
-#include "esp32-hal-bt.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-#include "mpu6500.h"
-#include <esp_bt.h>
+#include "compat_deps.h"
+
+#ifdef __has_include
+#if __has_include(<freertos/FreeRTOS.h>)
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#elif __has_include(<FreeRTOS.h>)
+#include <FreeRTOS.h>
+#include <queue.h>
+#include <semphr.h>
+#include <task.h>
+#endif
+#endif
 
 extern SemaphoreHandle_t stateMutex;
 extern QueueHandle_t cmdQueue;
@@ -67,12 +76,12 @@ extern volatile uint32_t lastInternetOkAt;
 extern uint32_t lastNetCheckAt;
 extern uint32_t lastPush;
 extern uint32_t lastPoll;
-extern bool wifiConnecting;
-extern bool wifiWasConnected;
-extern uint32_t wifiConnectStartedAt;
+extern bool netConnecting;
+extern bool netWasConnected;
+extern uint32_t netConnectStartedAt;
 extern uint32_t nextNetTryAt;
 extern uint32_t netBackoffMs;
-extern uint8_t netFailStreak;
+extern int netFailStreak;
 extern bool pendingReport;
 extern char pendingReportEvent[24];
 extern char pendingReportCmdId[40];
