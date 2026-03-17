@@ -37,7 +37,7 @@ void appendJsonEscaped(String& out, const char* text) {
 }
 
 bool shouldKeepPortalOn() {
-  return alarmLatched || !netIsConnected() || !gInternetOk;
+  return alarmLatched || !netIsConnected() || !gInternetOk || localApManualTrigger;
 }
 
 bool localCheckPinOk() {
@@ -253,6 +253,12 @@ void localPortalMaintenance() {
       localPortalStart();
     }
     return;
+  }
+
+  // Safety timeout for manual triggers (e.g. 30 minutes)
+  if (localApManualTrigger && (millis() - localApManualTriggerAt >= 30UL * 60UL * 1000UL)) {
+    LOG_PRINTLN_IF(DBG_LOCAL, "LOCAL", F("Manual AP timeout - turning off"));
+    localApManualTrigger = false;
   }
 
   localDns.processNextRequest();

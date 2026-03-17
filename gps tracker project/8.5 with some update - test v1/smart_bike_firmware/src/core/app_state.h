@@ -93,3 +93,6 @@ extern bool localApActive;
 extern uint32_t localApLastActivityAt;
 extern uint8_t localPinFailCount;
 extern uint32_t localPinLockedUntil;
+
+extern volatile bool localApManualTrigger;
+extern uint32_t localApManualTriggerAt;

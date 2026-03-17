@@ -62,3 +62,6 @@ bool localApActive = false;
 uint32_t localApLastActivityAt = 0;
 uint8_t localPinFailCount = 0;
 uint32_t localPinLockedUntil = 0;
+
+volatile bool localApManualTrigger = false;
+uint32_t localApManualTriggerAt = 0;

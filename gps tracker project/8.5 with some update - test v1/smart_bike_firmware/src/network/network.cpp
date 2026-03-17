@@ -4,6 +4,7 @@
 #include "../logging/logger.h"
 #include "../sensors/sensors.h"
 #include "../tracking/tracking.h"
+#include "../core/command_processor.h"
 
 namespace {
 
@@ -15,6 +16,10 @@ bool bearerReady = false;
 uint32_t lastInternetActivityAt = 0;
 int lastKnownCsq = -1;
 uint32_t lastHttpLatencyMs = 0;
+uint32_t lastSmsScanAt = 0;
+
+static constexpr uint32_t SMS_SCAN_INTERVAL_MS = 2500UL;
+static constexpr int SMS_MAX_BATCH = 6;
 
 String urlToRoute(const char* url) {
   if (!url || !url[0]) return "/";
@@ -58,6 +63,17 @@ void drainModemRx() {
   while (SerialAT.available()) {
     SerialAT.read();
   }
+}
+
+int findLineToken(const String& response, const char* token, int startAt = 0) {
+  if (!token || !token[0]) return -1;
+
+  int pos = response.indexOf(token, startAt);
+  while (pos >= 0) {
+    if (pos == 0 || response[pos - 1] == '\n') return pos;
+    pos = response.indexOf(token, pos + 1);
+  }
+  return -1;
 }
 
 bool responseHasError(const String& response) {
@@ -393,6 +409,8 @@ bool configureBearerProfile() {
   sendATReadComplete("ATI", ati, 4000);
   sendATOk("AT+CMEE=2", 3000);
   sendATOk("AT+CREG=0", 3000);
+  sendATOk("AT+CMGF=1", 3000);  // SMS text mode
+  sendATOk("AT+CNMI=2,1,0,0,0", 3000); // New message notification
 
   if (!waitForPacketNetwork(GSM_NETWORK_WAIT_MS)) return false;
 
@@ -644,6 +662,240 @@ bool httpInitForJson(const char* url) {
 
   if (!sendATOk("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 3000)) return false;
   return true;
+}
+
+void sendSmsReply(const char* sender, const char* text) {
+  if (!sender || !text || !sender[0]) return;
+  char sendCmd[48];
+  snprintf(sendCmd, sizeof(sendCmd), "AT+CMGS=\"%s\"", sender);
+  String resp;
+  if (sendATCommand(sendCmd, resp, 5000, ">")) {
+    SerialAT.print(text);
+    SerialAT.write(0x1A); // CTRL+Z
+    if (!readAfterRawWrite(resp, 10000, "OK")) {
+      LOG_PRINTLN_IF(DBG_NET, "SMS", F("Reply send failed"));
+    }
+  }
+}
+
+void deleteSmsFromStorage(int index) {
+  if (index < 0) return;
+
+  char deleteCmd[20];
+  snprintf(deleteCmd, sizeof(deleteCmd), "AT+CMGD=%d", index);
+  sendATOk(deleteCmd, 5000);
+}
+
+bool queueSmsCommand(const char* cmd) {
+  if (!cmd || !cmd[0] || !cmdQueue) return false;
+
+  CmdMsg msg = {};
+  strncpy(msg.cmd, cmd, sizeof(msg.cmd) - 1);
+  msg.cmd[sizeof(msg.cmd) - 1] = 0;
+  strncpy(msg.cmdId, "SMS", sizeof(msg.cmdId) - 1);
+  msg.cmdId[sizeof(msg.cmdId) - 1] = 0;
+
+  if (xQueueSend(cmdQueue, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("cmdQueue full"));
+    return false;
+  }
+  return true;
+}
+
+bool parseSmsHeader(const String& header, int* outIndex, String* outSender) {
+  if (outIndex) *outIndex = -1;
+  if (outSender) *outSender = "";
+
+  const int colon = header.indexOf(':');
+  if (colon < 0) return false;
+  const int comma = header.indexOf(',', colon + 1);
+  if (comma < 0) return false;
+
+  String indexText = header.substring(colon + 1, comma);
+  indexText.trim();
+  const int index = indexText.toInt();
+  if (index < 0) return false;
+
+  if (outIndex) *outIndex = index;
+
+  const int q1 = header.indexOf('"', comma + 1);
+  if (q1 < 0) return true;
+  const int q2 = header.indexOf('"', q1 + 1);
+  if (q2 < 0) return true;
+  const int q3 = header.indexOf('"', q2 + 1);
+  if (q3 < 0) return true;
+  const int q4 = header.indexOf('"', q3 + 1);
+  if (q4 < 0) return true;
+
+  if (outSender) *outSender = header.substring(q3 + 1, q4);
+  return true;
+}
+
+bool extractNextSmsFromList(const String& response,
+                            int startAt,
+                            int* nextAt,
+                            int* outIndex,
+                            String* outSender,
+                            String* outBody) {
+  if (nextAt) *nextAt = response.length();
+  if (outIndex) *outIndex = -1;
+  if (outSender) *outSender = "";
+  if (outBody) *outBody = "";
+
+  const int headerAt = findLineToken(response, "+CMGL:", startAt);
+  if (headerAt < 0) return false;
+
+  int lineEnd = response.indexOf("\r\n", headerAt);
+  int lineBreakLen = 2;
+  if (lineEnd < 0) {
+    lineEnd = response.indexOf('\n', headerAt);
+    lineBreakLen = 1;
+  }
+  if (lineEnd < 0) return false;
+
+  const String header = response.substring(headerAt, lineEnd);
+  if (!parseSmsHeader(header, outIndex, outSender)) return false;
+
+  const int bodyStart = lineEnd + lineBreakLen;
+  int nextHeaderAt = response.indexOf("\r\n+CMGL:", bodyStart);
+  if (nextHeaderAt >= 0) {
+    nextHeaderAt += 2;
+  } else {
+    nextHeaderAt = response.indexOf("\n+CMGL:", bodyStart);
+    if (nextHeaderAt >= 0) nextHeaderAt += 1;
+  }
+
+  int okAt = response.indexOf("\r\nOK", bodyStart);
+  if (okAt < 0) okAt = response.indexOf("\nOK", bodyStart);
+
+  int bodyEnd = response.length();
+  if (nextHeaderAt >= 0) {
+    bodyEnd = nextHeaderAt - 2;
+    if (bodyEnd < bodyStart) bodyEnd = nextHeaderAt - 1;
+  } else if (okAt >= 0) {
+    bodyEnd = okAt;
+  }
+
+  if (bodyEnd < bodyStart) bodyEnd = bodyStart;
+
+  if (outBody) {
+    *outBody = response.substring(bodyStart, bodyEnd);
+    outBody->trim();
+  }
+  if (nextAt) *nextAt = (nextHeaderAt >= 0) ? nextHeaderAt : response.length();
+  return true;
+}
+
+String normalizeSmsBody(const String& body) {
+  String normalized = body;
+  normalized.replace("\r", " ");
+  normalized.replace("\n", " ");
+  normalized.trim();
+  normalized.toUpperCase();
+  return normalized;
+}
+
+void processSmsMessage(int index, const String& sender, const String& rawBody) {
+  const String body = normalizeSmsBody(rawBody);
+
+  if (body.indexOf(DEVICE_ID) == -1 || body.indexOf(LOCAL_PIN) == -1) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unauthorized SMS (Bad ID or PIN)"));
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  if (body.indexOf("AP ON") != -1) {
+    localApManualTrigger = true;
+    localApManualTriggerAt = millis();
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Manual ON via SMS"));
+    if (sender.length() > 0) sendSmsReply(sender.c_str(), "Local AP: ON (30min timeout)");
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  if (body.indexOf("AP OFF") != -1) {
+    localApManualTrigger = false;
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("AP Manual OFF via SMS"));
+    if (sender.length() > 0) sendSmsReply(sender.c_str(), "Local AP: OFF");
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  if (body.indexOf("UNLOCK") != -1) {
+    const bool queued = queueSmsCommand("UNLOCK");
+    LOG_PRINTLN_IF(DBG_NET, "SMS", queued ? F("UNLOCK via SMS") : F("UNLOCK via SMS failed"));
+    if (sender.length() > 0) sendSmsReply(sender.c_str(), queued ? "Bike: UNLOCK queued" : "Bike: BUSY");
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  if (body.indexOf("LOCK") != -1) {
+    const bool queued = queueSmsCommand("LOCK");
+    LOG_PRINTLN_IF(DBG_NET, "SMS", queued ? F("LOCK via SMS") : F("LOCK via SMS failed"));
+    if (sender.length() > 0) sendSmsReply(sender.c_str(), queued ? "Bike: LOCK queued" : "Bike: BUSY");
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  if ((body.indexOf("STATUS") != -1 || body.indexOf("LOC") != -1) && sender.length() > 0) {
+    LOG_PRINTLN_IF(DBG_NET, "SMS", F("Status/Loc requested via SMS"));
+
+    DeviceStateId st = ST_UNLOCKED;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      st = getCurrentState_locked();
+      xSemaphoreGive(stateMutex);
+    }
+
+    char reply[160];
+    int rlen = snprintf(reply, sizeof(reply), "SmartBike %s: %s. ", DEVICE_ID, stateToString(st));
+    if (gps.location.isValid()) {
+      snprintf(reply + rlen, sizeof(reply) - rlen, "Loc: https://www.google.com/maps?q=%.6f,%.6f (Age: %lu)",
+               gps.location.lat(), gps.location.lng(), static_cast<unsigned long>(gps.location.age() / 1000));
+    } else if (gps.location.age() < 3600000UL) {
+      snprintf(reply + rlen, sizeof(reply) - rlen, "Last Loc: https://www.google.com/maps?q=%.6f,%.6f (Age: %lu min)",
+               gps.location.lat(), gps.location.lng(), static_cast<unsigned long>(gps.location.age() / 60000));
+    } else {
+      snprintf(reply + rlen, sizeof(reply) - rlen, "GPS: No Fix");
+    }
+
+    sendSmsReply(sender.c_str(), reply);
+    deleteSmsFromStorage(index);
+    return;
+  }
+
+  LOG_PRINTLN_IF(DBG_NET, "SMS", F("Unknown SMS command"));
+  if (sender.length() > 0) {
+    sendSmsReply(sender.c_str(), "Format: <DEVICE_ID> <PIN> LOCK | UNLOCK | STATUS | LOC | AP ON | AP OFF");
+  }
+  deleteSmsFromStorage(index);
+}
+
+void handleIncomingSms() {
+  const uint32_t now = millis();
+  if (now - lastSmsScanAt < SMS_SCAN_INTERVAL_MS) return;
+  lastSmsScanAt = now;
+
+  String response;
+  if (!sendATReadComplete("AT+CMGL=\"REC UNREAD\"", response, 12000)) return;
+
+  int cursor = 0;
+  int processed = 0;
+  while (processed < SMS_MAX_BATCH) {
+    int index = -1;
+    int nextAt = response.length();
+    String sender;
+    String body;
+    if (!extractNextSmsFromList(response, cursor, &nextAt, &index, &sender, &body)) break;
+
+    LOG_PRINTF_IF(DBG_NET, "SMS", "Unread SMS index=%d", index);
+    processSmsMessage(index, sender, body);
+    processed++;
+    cursor = nextAt;
+  }
+
+  if (processed > 0) {
+    LOG_PRINTF_IF(DBG_NET, "SMS", "Processed unread batch=%d", processed);
+  }
 }
 
 void gsmMaintenance() {
@@ -975,6 +1227,7 @@ void netTask(void* pv) {
 
   for (;;) {
     gsmMaintenance();
+    handleIncomingSms();
     internetProbe();
     pumpPendingReport();
 
